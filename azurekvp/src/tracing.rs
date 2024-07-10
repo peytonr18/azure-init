@@ -23,7 +23,7 @@ pub static TRACER: Lazy<()> = Lazy::new(|| {
    }
 
     // Set up the stdout exporter correctly
-    let exporter = stdout::Exporter::new(std::io::stdout(), true);
+    let exporter: stdout::Exporter<std::io::Stdout> = stdout::Exporter::new(std::io::stdout(), true);
 
     // Set up the TracerProvider with the stdout exporter
     let provider = sdktrace::TracerProvider::builder()
