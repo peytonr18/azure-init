@@ -20,6 +20,114 @@ fn help_groups() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// Help output should mention new subcommands
+#[test]
+fn help_shows_new_subcommands() -> Result<(), Box<dyn std::error::Error>> {
+    let mut command = Command::cargo_bin("azure-init")?;
+    command.arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("provision"))
+        .stdout(predicate::str::contains("report"))
+        .stdout(predicate::str::contains("status"));
+
+    Ok(())
+}
+
+fn write_config_with_data_dir(
+    data_dir: &std::path::Path,
+) -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
+    let temp_dir = tempdir()?;
+    let config_contents = format!(
+        r#"
+        [azure_init_data_dir]
+        path = "{}"
+        "#,
+        data_dir.display(),
+    );
+    let config_path = temp_dir.path().join("azure-init-config.toml");
+    fs::write(&config_path, config_contents)?;
+    // Store path to reuse via symlink for tests
+    std::os::unix::fs::symlink(&config_path, temp_dir.path().join("config"))
+        .ok();
+    Ok(temp_dir)
+}
+
+fn config_path_from_temp(temp_dir: &tempfile::TempDir) -> std::path::PathBuf {
+    temp_dir.path().join("config")
+}
+
+// Status should be NotReady when no markers exist
+#[test]
+fn status_not_ready_without_markers() -> Result<(), Box<dyn std::error::Error>>
+{
+    let base = tempdir()?;
+    let data_dir = base.path().join("data");
+    fs::create_dir_all(&data_dir)?;
+
+    let cfg_tmp = write_config_with_data_dir(&data_dir)?;
+    let cfg_path = config_path_from_temp(&cfg_tmp);
+
+    let mut cmd = Command::cargo_bin("azure-init")?;
+    cmd.args(["--config", cfg_path.to_str().unwrap(), "status"]);
+    cmd.assert()
+        .failure()
+        .stdout(predicate::str::contains("NotReady"));
+
+    Ok(())
+}
+
+// Status should be Ready when the .provisioned marker exists
+#[test]
+fn status_ready_with_provisioned_marker(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = tempdir()?;
+    let data_dir = base.path().join("data");
+    fs::create_dir_all(&data_dir)?;
+
+    // main() falls back to this VM ID when it cannot read the system VM ID
+    let fallback_vm_id = "00000000-0000-0000-0000-000000000000";
+    let provisioned = data_dir.join(format!("{}.provisioned", fallback_vm_id));
+    File::create(&provisioned)?;
+
+    let cfg_tmp = write_config_with_data_dir(&data_dir)?;
+    let cfg_path = config_path_from_temp(&cfg_tmp);
+
+    let mut cmd = Command::cargo_bin("azure-init")?;
+    cmd.args(["--config", cfg_path.to_str().unwrap(), "status"]);
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("Ready"));
+
+    Ok(())
+}
+
+// Status should be Failed when the .failure marker exists and no .provisioned
+#[test]
+fn status_failed_with_failure_marker() -> Result<(), Box<dyn std::error::Error>>
+{
+    let base = tempdir()?;
+    let data_dir = base.path().join("data");
+    fs::create_dir_all(&data_dir)?;
+
+    let fallback_vm_id = "00000000-0000-0000-0000-000000000000";
+    let failure = data_dir.join(format!("{}.failure", fallback_vm_id));
+    let mut f = File::create(&failure)?;
+    writeln!(f, "result=failure|details=test")?;
+
+    let cfg_tmp = write_config_with_data_dir(&data_dir)?;
+    let cfg_path = config_path_from_temp(&cfg_tmp);
+
+    let mut cmd = Command::cargo_bin("azure-init")?;
+    cmd.args(["--config", cfg_path.to_str().unwrap(), "status"]);
+    cmd.assert()
+        .failure()
+        .stdout(predicate::str::contains("Failed"));
+
+    Ok(())
+}
+
 // Ensure no password-related flags are exposed by the CLI
 #[test]
 fn help_has_no_password_flags() -> Result<(), Box<dyn std::error::Error>> {

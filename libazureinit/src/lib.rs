@@ -23,7 +23,9 @@ pub use provision::{
 };
 mod status;
 pub use status::{
-    get_vm_id, is_provisioning_complete, mark_provisioning_complete,
+    clear_provisioning_failure, get_vm_id, is_provisioning_complete,
+    mark_provisioning_complete, read_provisioning_failure,
+    write_provisioning_failure,
 };
 
 #[cfg(test)]

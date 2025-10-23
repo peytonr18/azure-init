@@ -37,6 +37,11 @@ fn get_provisioning_dir(config: Option<&Config>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_AZURE_INIT_DATA_DIR))
 }
 
+/// Returns the path for the provisioning failure marker file for the given VM ID.
+fn get_failure_marker_path(config: Option<&Config>, vm_id: &str) -> PathBuf {
+    get_provisioning_dir(config).join(format!("{vm_id}.failure"))
+}
+
 /// This function checks if the azure-init data directory is present, and if not,
 /// it creates it.
 fn check_provision_dir(config: Option<&Config>) -> Result<(), Error> {
@@ -252,6 +257,94 @@ pub fn mark_provisioning_complete(
     }
 
     Ok(())
+}
+
+/// Persists an encoded failure report for the given VM ID.
+///
+/// This creates a `{vm_id}.failure` marker in the provisioning directory with
+/// mode 0600 and writes the provided encoded report string.
+pub fn write_provisioning_failure(
+    config: Option<&Config>,
+    vm_id: &str,
+    encoded_report: &str,
+) -> Result<(), Error> {
+    check_provision_dir(config)?;
+    let file_path = get_failure_marker_path(config, vm_id);
+
+    match OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&file_path)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(encoded_report.as_bytes())?;
+            tracing::info!(
+                target: "libazureinit::status::failure_marker",
+                "Provisioning failure marker written: {}",
+                file_path.display()
+            );
+            Ok(())
+        }
+        Err(error) => {
+            tracing::error!(
+                ?error,
+                file_path=?file_path,
+                "Failed to create failure marker file"
+            );
+            Err(error.into())
+        }
+    }
+}
+
+/// Reads the encoded failure report for the given VM ID, if present.
+pub fn read_provisioning_failure(
+    config: Option<&Config>,
+    vm_id: &str,
+) -> Option<String> {
+    let file_path = get_failure_marker_path(config, vm_id);
+    match std::fs::read_to_string(&file_path) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::debug!(
+                    error=?e,
+                    file_path=?file_path,
+                    "Failed to read failure marker"
+                );
+            }
+            None
+        }
+    }
+}
+
+/// Removes the failure marker for the given VM ID, if it exists.
+pub fn clear_provisioning_failure(
+    config: Option<&Config>,
+    vm_id: &str,
+) -> Result<(), Error> {
+    let file_path = get_failure_marker_path(config, vm_id);
+    match std::fs::remove_file(&file_path) {
+        Ok(_) => {
+            tracing::info!(
+                target: "libazureinit::status::failure_marker",
+                "Cleared provisioning failure marker: {}",
+                file_path.display()
+            );
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                file_path=?file_path,
+                "Failed to remove failure marker file"
+            );
+            Err(error.into())
+        }
+    }
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use libazureinit::{
+    clear_provisioning_failure,
     config::Config,
     error::Error as LibError,
     get_vm_id,
@@ -14,8 +15,10 @@ use libazureinit::{
     logging::setup_layers,
     mark_provisioning_complete,
     media::{get_mount_device, mount_parse_ovf_env, Environment},
+    read_provisioning_failure,
     //report_failure_message, report_ready_simple,
     reqwest::{header, Client},
+    write_provisioning_failure,
     Provision,
     User,
 };
@@ -50,7 +53,7 @@ fn version_string() -> String {
 ///
 /// Arguments provided via command-line arguments override any arguments provided
 /// via environment variables.
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(disable_version_flag = true)]
 struct Cli {
     /// List of supplementary groups of the provisioned user account.
@@ -76,26 +79,46 @@ struct Cli {
     #[arg(long = "version", short = 'V', action = clap::ArgAction::SetTrue)]
     show_version: bool,
 
-    /// Report ready status to Azure health endpoint and exit
-    #[arg(long = "report-ready", action = clap::ArgAction::SetTrue)]
-    report_ready: bool,
-
-    /// Report failure status to Azure health endpoint and exit
-    #[arg(long = "report-failure")]
-    report_failure: Option<String>,
-
     #[command(subcommand)]
     command: Option<Command>,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 enum Command {
+    /// Provision the machine. Use --skip-check-in to avoid reporting to wireserver.
+    Provision {
+        /// Skip reporting success/failure to wireserver (only write local markers).
+        #[arg(long = "skip-check-in", action = clap::ArgAction::SetTrue)]
+        skip_check_in: bool,
+    },
+
+    /// Report provisioning status to wireserver.
+    Report {
+        #[command(subcommand)]
+        action: ReportCommand,
+    },
+
+    /// Print provisioning status derived from local markers.
+    Status,
+
     /// By default, this removes provisioning state data. Optional flags can be used
     /// to clean logs or additional generated files.
     Clean {
         /// Cleans the log files as defined in the configuration file
         #[arg(long)]
         logs: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum ReportCommand {
+    /// Report that provisioning is Ready.
+    Ready,
+    /// Report that provisioning Failed with a message.
+    Failure {
+        /// Failure message to include in the report.
+        #[arg(long)]
+        message: String,
     },
 }
 
@@ -316,70 +339,261 @@ async fn main() -> ExitCode {
         config
     );
 
-    let exit_code = if let Some(Command::Clean { logs }) = opts.command {
-        if clean_provisioning_status(&config).is_err()
-            || (logs && clean_log_file(&config).is_err())
-        {
-            ExitCode::FAILURE
-        } else {
-            ExitCode::SUCCESS
-        }
-    } else if is_provisioning_complete(Some(&config), &vm_id) {
-        tracing::info!(
-            "Provisioning already completed earlier. Skipping provisioning."
-        );
-        ExitCode::SUCCESS
-    } else {
-        let clone_config = config.clone();
-        match provision(config, &vm_id, opts).await {
-            Ok(_) => {
-                let report_result =
-                    report_ready(&clone_config, &vm_id, None).await;
-
-                if let Err(report_error) = report_result {
-                    tracing::warn!(
-                        "Failed to send provisioning success report: {:?}",
-                        report_error
-                    );
+    let exit_code = {
+        match opts.command.clone() {
+            Some(Command::Clean { logs }) => {
+                if clean_provisioning_status(&config).is_err()
+                    || (logs && clean_log_file(&config).is_err())
+                {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
                 }
-
-                tracing::info!("Provisioning completed successfully");
-
-                ExitCode::SUCCESS
             }
-            Err(e) => {
-                eprintln!("{e:?}");
-
-                let report_str = e
-                    .downcast_ref::<LibError>()
-                    .map(|lib_error| lib_error.as_encoded_report(&vm_id))
-                    .unwrap_or_else(|| {
-                        LibError::UnhandledError {
-                            details: format!("{e:?}"),
-                        }
-                        .as_encoded_report(&vm_id)
-                    });
-                let report_result =
-                    report_failure(report_str, &clone_config).await;
-
-                if let Err(report_error) = report_result {
-                    tracing::warn!(
-                        "Failed to send provisioning failure report: {:?}",
-                        report_error
-                    );
+            Some(Command::Status) => {
+                if is_provisioning_complete(Some(&config), &vm_id) {
+                    println!("Ready");
+                    ExitCode::SUCCESS
+                } else if let Some(_) =
+                    read_provisioning_failure(Some(&config), &vm_id)
+                {
+                    println!("Failed");
+                    let code: u8 = exitcode::SOFTWARE
+                        .try_into()
+                        .expect("Error code must be less than 256");
+                    ExitCode::from(code)
+                } else {
+                    println!("NotReady");
+                    let code: u8 = exitcode::TEMPFAIL
+                        .try_into()
+                        .expect("Error code must be less than 256");
+                    ExitCode::from(code)
                 }
-
-                tracing::error!("Provisioning failed with error: {e:?}");
-
-                let config: u8 = exitcode::CONFIG
-                    .try_into()
-                    .expect("Error code must be less than 256");
-                match e.root_cause().downcast_ref::<LibError>() {
-                    Some(LibError::UserMissing { user: _ }) => {
-                        ExitCode::from(config)
+            }
+            Some(Command::Report { action }) => match action {
+                ReportCommand::Ready => {
+                    match report_ready(&config, &vm_id, None).await {
+                        Ok(_) => ExitCode::SUCCESS,
+                        Err(e) => {
+                            tracing::error!("Report ready failed: {:?}", e);
+                            ExitCode::FAILURE
+                        }
                     }
-                    Some(LibError::NonEmptyPassword) => ExitCode::from(config),
-                    Some(_) | None => ExitCode::FAILURE,
+                }
+                ReportCommand::Failure { message } => {
+                    let encoded = LibError::UnhandledError { details: message }
+                        .as_encoded_report(&vm_id);
+                    match report_failure(encoded, &config).await {
+                        Ok(_) => ExitCode::SUCCESS,
+                        Err(e) => {
+                            tracing::error!("Report failure failed: {:?}", e);
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
+            },
+            Some(Command::Provision { skip_check_in }) => {
+                if is_provisioning_complete(Some(&config), &vm_id) {
+                    tracing::info!(
+                        "Provisioning already completed earlier. Skipping provisioning."
+                    );
+                    ExitCode::SUCCESS
+                } else {
+                    let clone_config = config.clone();
+                    match provision(config, &vm_id, opts.clone()).await {
+                        Ok(_) => {
+                            // Clear any prior failure marker on success
+                            if let Err(e) = clear_provisioning_failure(
+                                Some(&clone_config),
+                                &vm_id,
+                            ) {
+                                tracing::debug!(
+                                    "Failed to clear failure marker: {:?}",
+                                    e
+                                );
+                            }
+
+                            if !skip_check_in {
+                                if let Err(report_error) =
+                                    report_ready(&clone_config, &vm_id, None)
+                                        .await
+                                {
+                                    tracing::warn!(
+                                        "Failed to send provisioning success report: {:?}",
+                                        report_error
+                                    );
+                                }
+                            }
+
+                            tracing::info!(
+                                "Provisioning completed successfully"
+                            );
+                            ExitCode::SUCCESS
+                        }
+                        Err(e) => {
+                            eprintln!("{e:?}");
+                            let report_str = e
+                                .downcast_ref::<LibError>()
+                                .map(|lib_error| {
+                                    lib_error.as_encoded_report(&vm_id)
+                                })
+                                .unwrap_or_else(|| {
+                                    LibError::UnhandledError {
+                                        details: format!("{e:?}"),
+                                    }
+                                    .as_encoded_report(&vm_id)
+                                });
+
+                            // Persist failure marker for later reporting
+                            if let Err(err) = write_provisioning_failure(
+                                Some(&clone_config),
+                                &vm_id,
+                                &report_str,
+                            ) {
+                                tracing::debug!(
+                                    "Failed to write failure marker: {:?}",
+                                    err
+                                );
+                            }
+
+                            if !skip_check_in {
+                                if let Err(report_error) =
+                                    report_failure(report_str, &clone_config)
+                                        .await
+                                {
+                                    tracing::warn!(
+                                        "Failed to send provisioning failure report: {:?}",
+                                        report_error
+                                    );
+                                }
+                            }
+
+                            tracing::error!(
+                                "Provisioning failed with error: {e:?}"
+                            );
+
+                            let config: u8 = exitcode::CONFIG
+                                .try_into()
+                                .expect("Error code must be less than 256");
+                            match e.root_cause().downcast_ref::<LibError>() {
+                                Some(LibError::UserMissing { user: _ }) => {
+                                    ExitCode::from(config)
+                                }
+                                Some(LibError::NonEmptyPassword) => {
+                                    ExitCode::from(config)
+                                }
+                                Some(_) | None => ExitCode::FAILURE,
+                            }
+                        }
+                    }
+                }
+            }
+            None => {
+                // Treat no subcommand as: provision with auto check-in (default behavior)
+                match opts.command.clone().unwrap_or(Command::Provision {
+                    skip_check_in: false,
+                }) {
+                    Command::Provision { skip_check_in } => {
+                        // Reuse the Provision handler path above
+                        if is_provisioning_complete(Some(&config), &vm_id) {
+                            tracing::info!(
+                                "Provisioning already completed earlier. Skipping provisioning."
+                            );
+                            ExitCode::SUCCESS
+                        } else {
+                            let clone_config = config.clone();
+                            match provision(config, &vm_id, opts.clone()).await
+                            {
+                                Ok(_) => {
+                                    if let Err(e) = clear_provisioning_failure(
+                                        Some(&clone_config),
+                                        &vm_id,
+                                    ) {
+                                        tracing::debug!(
+                                            "Failed to clear failure marker: {:?}",
+                                            e
+                                        );
+                                    }
+                                    if !skip_check_in {
+                                        if let Err(report_error) = report_ready(
+                                            &clone_config,
+                                            &vm_id,
+                                            None,
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(
+                                                "Failed to send provisioning success report: {:?}",
+                                                report_error
+                                            );
+                                        }
+                                    }
+                                    tracing::info!(
+                                        "Provisioning completed successfully"
+                                    );
+                                    ExitCode::SUCCESS
+                                }
+                                Err(e) => {
+                                    eprintln!("{e:?}");
+                                    let report_str = e
+                                        .downcast_ref::<LibError>()
+                                        .map(|lib_error| {
+                                            lib_error.as_encoded_report(&vm_id)
+                                        })
+                                        .unwrap_or_else(|| {
+                                            LibError::UnhandledError {
+                                                details: format!("{e:?}"),
+                                            }
+                                            .as_encoded_report(&vm_id)
+                                        });
+                                    if let Err(err) = write_provisioning_failure(
+                                        Some(&clone_config),
+                                        &vm_id,
+                                        &report_str,
+                                    ) {
+                                        tracing::debug!(
+                                            "Failed to write failure marker: {:?}",
+                                            err
+                                        );
+                                    }
+                                    if !skip_check_in {
+                                        if let Err(report_error) =
+                                            report_failure(
+                                                report_str,
+                                                &clone_config,
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                "Failed to send provisioning failure report: {:?}",
+                                                report_error
+                                            );
+                                        }
+                                    }
+                                    tracing::error!(
+                                        "Provisioning failed with error: {e:?}"
+                                    );
+                                    let config: u8 =
+                                        exitcode::CONFIG.try_into().expect(
+                                            "Error code must be less than 256",
+                                        );
+                                    match e
+                                        .root_cause()
+                                        .downcast_ref::<LibError>()
+                                    {
+                                        Some(LibError::UserMissing {
+                                            user: _,
+                                        }) => ExitCode::from(config),
+                                        Some(LibError::NonEmptyPassword) => {
+                                            ExitCode::from(config)
+                                        }
+                                        Some(_) | None => ExitCode::FAILURE,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
                 }
             }
         }
