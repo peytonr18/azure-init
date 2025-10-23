@@ -111,6 +111,85 @@ pub async fn report_failure(
     .await
 }
 
+/// Reports provisioning success to Azure wireserver.
+///
+/// Automatically retrieves VM ID and loads configuration (or uses defaults).
+/// Useful for external callers that don't want to manage config/VM ID themselves.
+///
+/// # Example
+/// ```no_run
+/// use libazureinit::health::report_ready_simple;
+///
+/// #[tokio::main]
+/// async fn main() {
+///     if let Err(e) = report_ready_simple(None).await {
+///         eprintln!("Failed to report ready: {:?}", e);
+///     }
+/// }
+/// ```
+pub async fn report_ready_simple(
+    optional_key_value: Option<(&str, &str)>,
+) -> Result<(), Error> {
+    use crate::status::get_vm_id;
+
+    let vm_id = get_vm_id().unwrap_or_else(|| {
+        tracing::warn!("Could not retrieve VM ID, using fallback UUID");
+        "00000000-0000-0000-0000-000000000000".to_string()
+    });
+
+    // Try to load config from file, fall back to defaults if it fails
+    let config = Config::load(None).unwrap_or_else(|e| {
+        tracing::debug!("Could not load config file, using defaults: {:?}", e);
+        Config::default()
+    });
+
+    report_ready(&config, &vm_id, optional_key_value).await
+}
+
+/// Reports a failure message to Azure wireserver.
+///
+/// Automatically retrieves VM ID and loads configuration (or uses defaults).
+/// The message will be reported as an unhandled error.
+///
+/// For typed error reporting with specific error semantics, use the lower-level
+/// `report_failure(error.as_encoded_report(&vm_id), &config)` API.
+///
+/// # Example
+/// ```no_run
+/// use libazureinit::health::report_failure_message;
+///
+/// #[tokio::main]
+/// async fn main() {
+///     if let Err(e) = report_failure_message("Custom provisioning failed").await {
+///         eprintln!("Failed to report failure: {:?}", e);
+///     }
+/// }
+/// ```
+pub async fn report_failure_message(
+    message: impl Into<String>,
+) -> Result<(), Error> {
+    use crate::status::get_vm_id;
+
+    let vm_id = get_vm_id().unwrap_or_else(|| {
+        tracing::warn!("Could not retrieve VM ID, using fallback UUID");
+        "00000000-0000-0000-0000-000000000000".to_string()
+    });
+
+    // Try to load config from file, fall back to defaults if it fails
+    let config = Config::load(None).unwrap_or_else(|e| {
+        tracing::debug!("Could not load config file, using defaults: {:?}", e);
+        Config::default()
+    });
+
+    let error = Error::UnhandledError {
+        details: message.into(),
+    };
+
+    let report_str = error.as_encoded_report(&vm_id);
+
+    report_failure(report_str, &config).await
+}
+
 /// Reports provisioning as still in progress to the wireserver and/or KVP.
 pub async fn report_in_progress(
     config: &Config,

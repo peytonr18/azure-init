@@ -14,8 +14,10 @@ use libazureinit::{
     logging::setup_layers,
     mark_provisioning_complete,
     media::{get_mount_device, mount_parse_ovf_env, Environment},
+    //report_failure_message, report_ready_simple,
     reqwest::{header, Client},
-    Provision, User,
+    Provision,
+    User,
 };
 use std::process::ExitCode;
 use std::time::Duration;
@@ -73,6 +75,14 @@ struct Cli {
     /// Print version information and exit
     #[arg(long = "version", short = 'V', action = clap::ArgAction::SetTrue)]
     show_version: bool,
+
+    /// Report ready status to Azure health endpoint and exit
+    #[arg(long = "report-ready", action = clap::ArgAction::SetTrue)]
+    report_ready: bool,
+
+    /// Report failure status to Azure health endpoint and exit
+    #[arg(long = "report-failure")]
+    report_failure: Option<String>,
 
     #[command(subcommand)]
     command: Option<Command>,

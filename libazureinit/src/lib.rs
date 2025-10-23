@@ -8,6 +8,7 @@ pub mod config;
 pub use config::{HostnameProvisioner, PasswordProvisioner, UserProvisioner};
 pub mod error;
 pub mod health;
+pub use health::{report_failure_message, report_ready_simple};
 pub(crate) mod http;
 pub mod imds;
 mod kvp;
