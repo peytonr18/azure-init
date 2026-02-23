@@ -3,6 +3,9 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
+use azure_init_kvp::{
+    build_subscriber, SpecialFieldMapping, TelemetryComposeConfig,
+};
 use clap::{Parser, Subcommand};
 use libazureinit::{
     config::Config,
@@ -11,7 +14,6 @@ use libazureinit::{
     health::{report_failure, report_ready},
     imds::{query, InstanceMetadata},
     is_provisioning_complete,
-    logging::setup_layers,
     mark_provisioning_complete,
     media::{get_mount_device, mount_parse_ovf_env, Environment},
     reqwest::{header, Client},
@@ -264,8 +266,25 @@ async fn main() -> ExitCode {
     let setup_result =
         tracing::subscriber::with_default(temp_subscriber, || {
             let config = Config::load(opts.config.clone())?;
+            let telemetry_cfg = TelemetryComposeConfig {
+                app_name: "azure-init".to_string(),
+                app_version: env!("CARGO_PKG_VERSION").to_string(),
+                vm_id: vm_id.clone(),
+                kvp_enabled: config.telemetry.kvp_diagnostics,
+                kvp_pool_path: std::path::PathBuf::from(
+                    "/var/lib/hyperv/.kvp_pool_1",
+                ),
+                kvp_filter_from_config: config.telemetry.kvp_filter.clone(),
+                kvp_filter_env_var: "AZURE_INIT_KVP_FILTER".to_string(),
+                log_filter_env_var: "AZURE_INIT_LOG".to_string(),
+                file_log_path: Some(config.azure_init_log_path.path.clone()),
+                special_field_mappings: vec![SpecialFieldMapping::new(
+                    "health_report",
+                    "PROVISIONING_REPORT",
+                )],
+            };
             let (subscriber, rx) =
-                setup_layers(&vm_id, &config, graceful_shutdown.clone())?;
+                build_subscriber(&telemetry_cfg, graceful_shutdown.clone())?;
             if let Err(e) = tracing::subscriber::set_global_default(subscriber)
             {
                 eprintln!("Failed to set global default subscriber: {e}");

@@ -20,6 +20,7 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 tokio-util = "0.7" 
 
 sysinfo = "0.38"
+azure-init-kvp = { git = "https://github.com/peytonr18/azure-init-kvp.git", rev = "4d051a588eb1147c02bf9ea531cfe8af43df1235" }
 
 [dev-dependencies]
 assert_cmd = "2.0.16"
