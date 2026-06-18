@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 #
-# Demo: inspecting azure-init diagnostics and a provisioning report with the
+# Demo: inspecting real azure-init / cloud-init guest KVP pools with the
 # libazureinit-kvp CLI.
 #
-# This walks through writing some sample diagnostics + a provisioning report
-# into a KVP pool file and reading them back with the CLI -- primarily via
-# `dump`. It does NOT touch the real Hyper-V pool at /var/lib/hyperv; it uses a
-# throwaway directory so it is safe to run anywhere.
+# The pools come from KVP telemetry logs captured off three VMs:
+#   * azure-init.kvp  -- an azure-init guest that provisioned successfully
+#   * cloud-init.kvp  -- a cloud-init guest that provisioned successfully
+#   * failed-vm.kvp   -- a cloud-init guest with a forced provisioning failure
+#
+# At setup we rebuild each capture into a real binary pool file, then stage it
+# the way Hyper-V would (a .kvp_pool_1 file the guest reads) and inspect it.
+# This does NOT touch the real host pool at /var/lib/hyperv -- everything runs
+# in a throwaway directory, and the "sudo cp ... /var/lib/hyperv" lines shown
+# are illustrative only.
 #
 # Usage:
 #   ./run-demo.sh            # step through, pausing between commands
@@ -17,19 +23,21 @@ set -euo pipefail
 # --- Locate the repo, the CLI binary, and the demo data -----------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+PARSER="$SCRIPT_DIR/kvp_log_to_pairs.py"
+KVPBIN="$REPO_ROOT/target/debug/libazureinit-kvp"
 
-# Throwaway pool directory. The CLI derives the file name (.kvp_pool_1 for the
-# guest pool) from --pool, so we only point it at a directory.
-POOL_DIR="${POOL_DIR:-$SCRIPT_DIR/.demo-pool}"
-DIAGNOSTICS="diagnostics.kvp"
-REPORT="provisioning-report.kvp"
-
-# Run from the demo directory so the input files show up as short,
-# copy-pasteable paths in the echoed commands (e.g. `--file diagnostics.kvp`).
+# Run from the demo directory so input files show up as short paths.
 cd "$SCRIPT_DIR"
 
 # Pause between steps unless STEP=0 (handy for a live, narrated demo).
 STEP="${STEP:-1}"
+
+# Throwaway workspace. We mimic the host layout (.../var/lib/hyperv) so the
+# guest pool file path looks familiar, without ever touching the real one.
+WORK="$(mktemp -d)"
+FAKE_HYPERV="$WORK/var/lib/hyperv"
+mkdir -p "$FAKE_HYPERV"
+trap 'rm -rf "$WORK"' EXIT
 
 # --- Pretty helpers -----------------------------------------------------------
 BOLD="$(tput bold 2>/dev/null || true)"
@@ -38,19 +46,20 @@ CYAN="$(tput setaf 6 2>/dev/null || true)"
 GREEN="$(tput setaf 2 2>/dev/null || true)"
 RESET="$(tput sgr0 2>/dev/null || true)"
 
-KVP=()
+# CLI invocation targeting the staged guest pool. --pool/--dir are hidden from
+# the echoed commands so they read like a default on-host invocation.
+KVP=("$KVPBIN" --pool guest --dir "$FAKE_HYPERV")
 
 say() { printf '\n%s\n' "${BOLD}${CYAN}# $*${RESET}"; }
 
 pause() {
   if [[ "$STEP" != "0" ]]; then
-    printf '%s' "${DIM}  (press enter)${RESET}"
     read -r _
   fi
 }
 
-# Render an argument list the way a user would actually type it, quoting any
-# argument that contains whitespace so the echoed command is copy-pasteable.
+# Render an argument list the way a user would type it, quoting any argument
+# that contains whitespace so the echoed command is copy-pasteable.
 fmt_args() {
   local out="" a
   for a in "$@"; do
@@ -64,10 +73,10 @@ fmt_args() {
 }
 
 # Echo a CLI invocation, then run it. Non-zero exits are reported (not fatal)
-# so we can demonstrate commands that signal status through their exit code
-# (e.g. `read` of a missing key, `is-stale` on a fresh pool).
+# so we can demonstrate commands that signal status via exit code (e.g. `read`
+# of a missing key).
 run() {
-  printf '%s\n' "${GREEN}\$ libazureinit-kvp $(fmt_args "$@")${RESET}"
+  printf '%s\n' "${DIM}\$${RESET} ${GREEN}libazureinit-kvp $(fmt_args "$@")${RESET}"
   local rc=0
   "${KVP[@]}" "$@" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
@@ -76,121 +85,101 @@ run() {
   return 0
 }
 
-# Echo a CLI invocation piped through grep, then run it -- used to spotlight a
-# few records without dumping the whole pool.
-run_grep() {
-  local pattern="$1"
+# Echo a CLI invocation piped through `head`, then run it -- used to peek at
+# the top of a large pool without dumping every record.
+run_head() {
+  local n="$1"
   shift
-  printf '%s\n' "${GREEN}\$ libazureinit-kvp $(fmt_args "$@") | grep ${pattern}${RESET}"
-  "${KVP[@]}" "$@" | grep "$pattern" || true
+  printf '%s\n' "${DIM}\$${RESET} ${GREEN}libazureinit-kvp $(fmt_args "$@")${RESET}${DIM} | head -n ${n}${RESET}"
+  "${KVP[@]}" "$@" 2>/dev/null | head -n "$n" || true
 }
 
-# Echo a `cat`/`head` of an input file and print it, so the audience sees
-# exactly what the data fed to `load` / `append-multiple` has to look like.
-# Pass a line count as the 2nd arg to preview only the first N lines.
-show_file() {
-  local file="$1" n="${2:-0}"
-  if [[ "$n" -gt 0 ]]; then
-    printf '%s\n' "${GREEN}\$ head -n ${n} ${file}${RESET}"
-    head -n "$n" "$file"
-  else
-    printf '%s\n' "${GREEN}\$ cat ${file}${RESET}"
-    cat "$file"
-  fi
+# Stage a prebuilt pool as the guest's .kvp_pool_1, showing the copy the way an
+# operator would run it on the host (path is illustrative; see header).
+stage_pool() {
+  local name="$1"
+  printf '%s\n' "${DIM}\$${RESET} ${GREEN}sudo cp ${name}.kvp_pool_1 /var/lib/hyperv/.kvp_pool_1${RESET}"
+  cp "$WORK/pools/$name/.kvp_pool_1" "$FAKE_HYPERV/.kvp_pool_1"
 }
 
-# --- Build the CLI ------------------------------------------------------------
-say "Building the libazureinit-kvp CLI"
+# Rebuild a capture log into a real binary pool. --unsafe lifts the per-record
+# limits so large cloud-init telemetry values load verbatim.
+build_pool() {
+  local log="$1" name="$2"
+  mkdir -p "$WORK/pools/$name"
+  python3 "$PARSER" "$SCRIPT_DIR/$log" \
+    | "$KVPBIN" --pool guest --dir "$WORK/pools/$name" --unsafe load >/dev/null
+}
+
+# --- Setup (quiet) ------------------------------------------------------------
+say "Building the libazureinit-kvp CLI and staging captured guest pools"
 cargo build --quiet -p libazureinit-kvp --bin libazureinit-kvp
-KVP=("$REPO_ROOT/target/debug/libazureinit-kvp" --pool guest --dir "$POOL_DIR")
-printf '%s\n' "${DIM}  binary: $REPO_ROOT/target/debug/libazureinit-kvp${RESET}"
-printf '%s\n' "${DIM}  pool dir: $POOL_DIR (throwaway; not /var/lib/hyperv)${RESET}"
+build_pool azure-init.kvp azure-init
+build_pool cloud-init.kvp cloud-init
+build_pool failed-vm.kvp  failed-vm
+printf '%s\n' "${DIM}  rebuilt 3 pools from captured KVP logs (azure-init, cloud-init, failed-vm)${RESET}"
+printf '%s\n' "${DIM}  working dir: $WORK (throwaway; the real host pool is untouched)${RESET}"
+pause
 
-# Start from a clean slate so the demo is repeatable.
-mkdir -p "$POOL_DIR"
+# --- 1. A successful azure-init guest -----------------------------------------
+say "1. A guest provisioned by azure-init -- drop its pool in place and peek at the top"
+stage_pool azure-init
+run_head 6 dump
+printf '%s\n' "${DIM}  every line is one telemetry record: span/event keys with timing + messages${RESET}"
+pause
+
+say "   Did provisioning succeed? Read the provisioning report:"
+run read PROVISIONING_REPORT
+printf '%s\n' "${DIM}  result=success -- azure-init reported the VM provisioned cleanly${RESET}"
+pause
+
+# --- 2. A successful cloud-init guest -----------------------------------------
+say "2. A guest provisioned by cloud-init -- same pool, different producer"
+stage_pool cloud-init
+run_head 6 dump
+printf '%s\n' "${DIM}  cloud-init writes JSON event records, but the pool format is identical${RESET}"
+pause
+
+say "   And its provisioning report:"
+run read PROVISIONING_REPORT
+printf '%s\n' "${DIM}  result=success -- cloud-init agrees the VM came up fine${RESET}"
+pause
+
+# --- 3. A failed guest --------------------------------------------------------
+say "3. A guest where provisioning FAILED -- stage its pool and read the report"
+stage_pool failed-vm
+run read PROVISIONING_REPORT
+printf '%s\n' "${DIM}  result=error with a reason + documentation_url -- exactly what we triage${RESET}"
+pause
+
+# --- 4. Editing a pool: write + delete + clear --------------------------------
+say "4. The CLI also edits pools. Re-stage the azure-init pool, then 'write' an operator note:"
+stage_pool azure-init
+run write operator/note "triaged 2026-06-17, provisioning OK"
+printf '%s\n' "${DIM}  'write' added a record.${RESET}"
+pause
+
+say "   Read it straight back to confirm it's there:"
+run read operator/note
+pause
+
+say "   Now remove a key with 'delete':"
+run delete PROVISIONING_REPORT
+printf '%s\n' "${DIM}  'delete' prints true when it removed a record.${RESET}"
+pause
+
+say "   Read it back -- it's gone:"
+run read PROVISIONING_REPORT
+printf '%s\n' "${DIM}  'read' exits 1 because the key no longer exists${RESET}"
+pause
+
+say "   Finally, 'clear' empties the whole pool:"
 run clear
 pause
 
-say "1. Nothing provisioned yet -- the pool is empty"
-run info
-pause
-
-say "2. Load the diagnostics a provisioning run produced -- here is the input file"
-printf '%s\n' "${DIM}  KEY=VALUE per line; previewing the first 4 of $(wc -l < "$DIAGNOSTICS") records:${RESET}"
-show_file "$DIAGNOSTICS" 4
-printf '%s\n' "${DIM}  now load the whole file into the pool:${RESET}"
-run load --file "$DIAGNOSTICS"
-pause
-
-say "3. Dump every diagnostic record in the order it was written"
-run dump
-pause
-
-say "4. Append a provisioning report on top -- this is the input it expects"
-show_file "$REPORT"
-printf '%s\n' "${DIM}  append those records with 'append-multiple --file':${RESET}"
-run append-multiple --file "$REPORT"
-pause
-
-say "5. Dump everything now in the pool (diagnostics + report)"
-run dump
-pause
-
-say "6. 'entries' gives a sorted, de-duplicated view -- the report keys group together"
-run entries
-pause
-
-say "7. 'read' a single value back by key"
-run read "azure-init/report/status"
-run read "azure-init/report/duration_ms"
-printf '%s\n' "${DIM}  ...and a key that does not exist -- signalled via exit status 1:${RESET}"
-run read "azure-init/report/does-not-exist"
-pause
-
-say "8. 'write' a single record -- e.g. an operator annotating the pool"
-run write "azure-init/report/remediation" "Restarted azure-init.service at 23:05Z"
-run read "azure-init/report/remediation"
-pause
-
-say "9. 'write --append' keeps prior values for a key instead of replacing"
-run write --append "azure-init/report/remediation" "Re-ran provisioning at 23:07Z"
-printf '%s\n' "${DIM}  dump preserves BOTH values (duplicate keys, in write order):${RESET}"
-run_grep remediation dump
-printf '%s\n' "${DIM}  while 'read' returns only the most recent value:${RESET}"
-run read "azure-init/report/remediation"
-pause
-
-say "10. 'delete' removes every record for a key (prints true / false)"
-run delete "azure-init/report/remediation"
-printf '%s\n' "${DIM}  deleting again prints false -- nothing left to remove:${RESET}"
-run delete "azure-init/report/remediation"
-pause
-
-say "11. 'delete-multiple' removes several keys at once (prints count removed)"
-run delete-multiple \
-  "azure-init/report/warnings" \
-  "azure-init/report/errors" \
-  "azure-init/report/imds_endpoint"
-pause
-
-say "12. 'is-stale' reports whether the pool predates the current boot"
-printf '%s\n' "${DIM}  fresh data -> not stale -> exit status 1:${RESET}"
-run is-stale
-pause
-
-say "13. 'clear --if-stale' only clears a stale pool -- fresh data is left intact"
-run clear --if-stale
-run info
-pause
-
-say "14. Machine-readable JSON for downstream tooling (e.g. pipe to jq)"
-run --json entries
-pause
-
-say "15. 'clear' unconditionally empties the pool"
-run clear
-run info
+say "   Dump confirms there's nothing left:"
+run_head 6 dump
+printf '%s\n' "${DIM}  the pool is empty${RESET}"
 pause
 
 say "Demo complete. Re-run with STEP=0 for a non-interactive pass."
-printf '%s\n' "${DIM}  pool file left at: $POOL_DIR/.kvp_pool_1${RESET}"
