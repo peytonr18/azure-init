@@ -21,7 +21,8 @@ mod vm_id;
 
 pub use cli::run;
 pub use diagnostics::{
-    DiagnosticEvent, DiagnosticRecord, DiagnosticsKvp, MAX_CHUNK_BYTES,
+    CloudInitEvent, DiagnosticEvent, DiagnosticRecord, DiagnosticsKvp,
+    MAX_CHUNK_BYTES,
 };
 pub use error::KvpError;
 pub use report::{

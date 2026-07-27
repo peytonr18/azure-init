@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -94,7 +95,7 @@ enum Command {
     /// decode each record instead of printing raw KEY=VALUE lines.
     Dump {
         /// Reassemble chunked diagnostic events and decode each record as
-        /// an event, raw, or malformed entry.
+        /// an azure-init event, cloud-init event, raw, or malformed entry.
         #[arg(long)]
         parse_diagnostics: bool,
         /// Also print raw (non-event) records such as PROVISIONING_REPORT.
@@ -538,6 +539,30 @@ fn diagnostics_records<W: Write>(
                         chunks,
                         event.message
                     ),
+                    DiagnosticRecord::CloudInit { event, chunks } => {
+                        let mut line = format!(
+                            "cloud-init-event type={} name={} uuid={}",
+                            event.event_type, event.name, event.uuid
+                        );
+                        if let Some(vm_id) = &event.vm_id {
+                            let _ = write!(line, " vm_id={vm_id}");
+                        }
+                        if let Some(result) = &event.result {
+                            let _ = write!(line, " result={result}");
+                        }
+                        if let Some(ts) = &event.timestamp {
+                            let _ = write!(line, " ts={ts}");
+                        }
+                        if let Some(duration) = event.duration {
+                            let _ = write!(line, " duration={duration}");
+                        }
+                        let _ = write!(
+                            line,
+                            " incarnation={} chunks={} message={}",
+                            event.incarnation, chunks, event.message
+                        );
+                        line
+                    }
                     DiagnosticRecord::Raw { key, value } => {
                         format!("raw key={key} value={value}")
                     }
@@ -622,6 +647,29 @@ fn diagnostics_record_json(record: &DiagnosticRecord) -> serde_json::Value {
                 map.insert("chunks".to_string(), json!(chunks));
             }
             value
+        }
+        DiagnosticRecord::CloudInit { event, chunks } => {
+            let mut map = serde_json::Map::new();
+            map.insert("kind".to_string(), json!("cloud-init-event"));
+            map.insert("incarnation".to_string(), json!(event.incarnation));
+            map.insert("type".to_string(), json!(event.event_type));
+            map.insert("name".to_string(), json!(event.name));
+            if let Some(vm_id) = &event.vm_id {
+                map.insert("vm_id".to_string(), json!(vm_id));
+            }
+            map.insert("uuid".to_string(), json!(event.uuid));
+            if let Some(ts) = &event.timestamp {
+                map.insert("ts".to_string(), json!(ts));
+            }
+            if let Some(result) = &event.result {
+                map.insert("result".to_string(), json!(result));
+            }
+            if let Some(duration) = event.duration {
+                map.insert("duration".to_string(), json!(duration));
+            }
+            map.insert("chunks".to_string(), json!(chunks));
+            map.insert("message".to_string(), json!(event.message));
+            serde_json::Value::Object(map)
         }
         DiagnosticRecord::Raw { key, value } => json!({
             "kind": "raw",

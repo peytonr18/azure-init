@@ -25,6 +25,73 @@ fn diagnostics(dir: &TempDir) -> DiagnosticsKvp {
     DiagnosticsKvp::new(store, VM_ID, PREFIX)
 }
 
+/// Real cloud-init reporting entries captured from a guest pool 1 file.
+/// Each tuple is one record's `(key, JSON value)`.
+const CLOUD_INIT_RECORDS: &[(&str, &str)] = &[
+    (
+        "CLOUD_INIT|1785187982|finish|modules-final/config-scripts_user|0e5e179d-5341-478b-8456-fbb90621bdf8|e5f01809-a7a3-4279-aa64-1f18e21eda6e",
+        r#"{"name":"modules-final/config-scripts_user","type":"finish","ts":"2026-07-27T21:33:24.339006+00:00","result":"SUCCESS","duration":0.0006448590000012189,"msg":"config-scripts_user ran successfully and took 0.001 seconds"}"#,
+    ),
+    (
+        "CLOUD_INIT|1785187982|start|modules-final/config-ssh_authkey_fingerprints|0e5e179d-5341-478b-8456-fbb90621bdf8|c4d4a08d-fe93-4c7a-9be6-9a38c212e212",
+        r#"{"name":"modules-final/config-ssh_authkey_fingerprints","type":"start","ts":"2026-07-27T21:33:24.339170+00:00","msg":"running config-ssh_authkey_fingerprints with frequency once-per-instance"}"#,
+    ),
+    (
+        "CLOUD_INIT|1785187982|finish|modules-final|0e5e179d-5341-478b-8456-fbb90621bdf8|126f969f-13fd-4b4b-a136-b7114518491f",
+        r#"{"name":"modules-final","type":"finish","ts":"2026-07-27T21:33:24.431885+00:00","result":"SUCCESS","duration":0.340712044,"msg":"running modules for final"}"#,
+    ),
+];
+
+#[test]
+fn reads_and_parses_real_cloud_init_pool() {
+    let dir = TempDir::new().unwrap();
+    let store =
+        KvpPoolStore::new_in(KvpPool::Guest, dir.path(), PoolMode::Safe)
+            .unwrap();
+    for &(key, value) in CLOUD_INIT_RECORDS {
+        store.append(key, value).unwrap();
+    }
+
+    // A DiagnosticsKvp with no azure-init identity still reads cloud-init
+    // entries written by another agent.
+    let diagnostics = DiagnosticsKvp::new(store, "", "");
+    let records = diagnostics.records().unwrap();
+    assert_eq!(records.len(), CLOUD_INIT_RECORDS.len());
+
+    // Every record decodes as a cloud-init event (none fall back to raw).
+    for record in &records {
+        assert!(matches!(record, DiagnosticRecord::CloudInit { .. }));
+    }
+
+    match &records[0] {
+        DiagnosticRecord::CloudInit { event, chunks } => {
+            assert_eq!(*chunks, 1);
+            assert_eq!(event.event_type, "finish");
+            assert_eq!(event.name, "modules-final/config-scripts_user");
+            assert_eq!(
+                event.vm_id.as_deref(),
+                Some("0e5e179d-5341-478b-8456-fbb90621bdf8")
+            );
+            assert_eq!(event.result.as_deref(), Some("SUCCESS"));
+            assert_eq!(
+                event.message,
+                "config-scripts_user ran successfully and took 0.001 seconds"
+            );
+        }
+        other => panic!("expected cloud-init event, got {other:?}"),
+    }
+
+    // A `start` event carries neither result nor duration.
+    match &records[1] {
+        DiagnosticRecord::CloudInit { event, .. } => {
+            assert_eq!(event.event_type, "start");
+            assert!(event.result.is_none());
+            assert!(event.duration.is_none());
+        }
+        other => panic!("expected cloud-init event, got {other:?}"),
+    }
+}
+
 #[test]
 fn short_event_round_trips_as_single_record() {
     let dir = TempDir::new().unwrap();
