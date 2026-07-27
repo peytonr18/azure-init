@@ -335,6 +335,76 @@ fn dump_parse_diagnostics_json_reassembles_and_classifies() {
 }
 
 #[test]
+fn dump_parse_diagnostics_text_renders_cloud_init_event() {
+    let dir = TempDir::new().unwrap();
+    // A finish event carries every optional field (vm_id, result, ts,
+    // duration); a start event omits result and duration.
+    assert_success(kvp(&with_dir(
+        &dir,
+        &[
+            "write",
+            "--append",
+            "CLOUD_INIT|1785187982|finish|modules-final/config-scripts_user|0e5e179d-5341-478b-8456-fbb90621bdf8|e5f01809-a7a3-4279-aa64-1f18e21eda6e",
+            r#"{"name":"modules-final/config-scripts_user","type":"finish","ts":"2026-07-27T21:33:24.339006+00:00","result":"SUCCESS","duration":0.5,"msg":"scripts ran"}"#,
+        ],
+    )));
+    assert_success(kvp(&with_dir(
+        &dir,
+        &[
+            "write",
+            "--append",
+            "CLOUD_INIT|1785187982|start|modules-final/config-keys_to_console|0e5e179d-5341-478b-8456-fbb90621bdf8|7792621b-b339-4274-8b71-2a3dcbd2db4e",
+            r#"{"name":"modules-final/config-keys_to_console","type":"start","ts":"2026-07-27T21:33:24.344349+00:00","msg":"running keys_to_console"}"#,
+        ],
+    )));
+
+    let out =
+        assert_success(kvp(&with_dir(&dir, &["dump", "--parse-diagnostics"])));
+    // The finish event renders every optional field.
+    assert!(out.contains("cloud-init-event type=finish"));
+    assert!(out.contains("name=modules-final/config-scripts_user"));
+    assert!(out.contains("vm_id=0e5e179d-5341-478b-8456-fbb90621bdf8"));
+    assert!(out.contains("result=SUCCESS"));
+    assert!(out.contains("ts=2026-07-27T21:33:24.339006+00:00"));
+    assert!(out.contains("duration=0.5"));
+    assert!(out.contains("incarnation=1785187982"));
+    assert!(out.contains("chunks=1"));
+    assert!(out.contains("message=scripts ran"));
+    // The start event omits result and duration.
+    assert!(out.contains("cloud-init-event type=start"));
+}
+
+#[test]
+fn dump_parse_diagnostics_json_renders_cloud_init_event() {
+    let dir = TempDir::new().unwrap();
+    assert_success(kvp(&with_dir(
+        &dir,
+        &[
+            "write",
+            "--append",
+            "CLOUD_INIT|1785187982|finish|modules-final/config-scripts_user|0e5e179d-5341-478b-8456-fbb90621bdf8|e5f01809-a7a3-4279-aa64-1f18e21eda6e",
+            r#"{"name":"modules-final/config-scripts_user","type":"finish","ts":"2026-07-27T21:33:24.339006+00:00","result":"SUCCESS","duration":0.5,"msg":"scripts ran"}"#,
+        ],
+    )));
+
+    let out = assert_success(kvp(&with_dir(
+        &dir,
+        &["--json", "dump", "--parse-diagnostics"],
+    )));
+    assert!(out.contains("\"kind\":\"cloud-init-event\""));
+    assert!(out.contains("\"incarnation\":\"1785187982\""));
+    assert!(out.contains("\"type\":\"finish\""));
+    assert!(out.contains("\"name\":\"modules-final/config-scripts_user\""));
+    assert!(out.contains("\"vm_id\":\"0e5e179d-5341-478b-8456-fbb90621bdf8\""));
+    assert!(out.contains("\"uuid\":\"e5f01809-a7a3-4279-aa64-1f18e21eda6e\""));
+    assert!(out.contains("\"ts\":\"2026-07-27T21:33:24.339006+00:00\""));
+    assert!(out.contains("\"result\":\"SUCCESS\""));
+    assert!(out.contains("\"duration\":0.5"));
+    assert!(out.contains("\"chunks\":1"));
+    assert!(out.contains("\"message\":\"scripts ran\""));
+}
+
+#[test]
 fn dump_parse_diagnostics_filters_by_level() {
     let dir = TempDir::new().unwrap();
     assert_success(kvp(&with_dir(

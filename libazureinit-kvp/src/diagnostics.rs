@@ -755,6 +755,10 @@ mod tests {
 
     #[rstest]
     #[case::event("p|vm|INFO|name|id", "event")]
+    #[case::cloud_init(
+        "CLOUD_INIT|1785187982|finish|name|vmid|uuid",
+        "cloud-init"
+    )]
     #[case::raw_single_segment("PROVISIONING_REPORT", "raw")]
     #[case::raw_too_few_segments("a|b|INFO|c", "raw")]
     #[case::raw_too_many_segments("a|b|INFO|c|d|e", "raw")]
@@ -982,68 +986,68 @@ mod tests {
 
     #[test]
     fn cloud_init_finish_record_decodes_all_fields() {
-        let record = classify_record(
-            CLOUD_INIT_KEY_FINISH.to_string(),
-            vec![CLOUD_INIT_VALUE_FINISH.to_string()],
-        );
-        match record {
-            DiagnosticRecord::CloudInit { event, chunks } => {
-                assert_eq!(chunks, 1);
-                assert_eq!(event.incarnation, "1785187982");
-                assert_eq!(event.event_type, "finish");
-                assert_eq!(event.name, "modules-final/config-scripts_user");
-                assert_eq!(event.vm_id.as_deref(), Some(CLOUD_INIT_VM_ID));
-                assert_eq!(event.uuid, "e5f01809-a7a3-4279-aa64-1f18e21eda6e");
-                assert_eq!(
-                    event.timestamp.as_deref(),
-                    Some("2026-07-27T21:33:24.339006+00:00")
-                );
-                assert_eq!(event.result.as_deref(), Some("SUCCESS"));
-                assert!(event
-                    .duration
-                    .is_some_and(
-                        |d| (d - 0.000_644_859_000_001_218_9).abs() < 1e-12
-                    ));
-                assert_eq!(
-                    event.message,
-                    "config-scripts_user ran successfully and took 0.001 \
-                     seconds"
-                );
-            }
-            other => panic!("expected cloud-init event, got {other:?}"),
-        }
+        // A single `matches!` covers every field (with a tolerance on the
+        // float duration) and leaves no unreachable arm to cover.
+        assert!(matches!(
+            classify_record(
+                CLOUD_INIT_KEY_FINISH.to_string(),
+                vec![CLOUD_INIT_VALUE_FINISH.to_string()],
+            ),
+            DiagnosticRecord::CloudInit { event, chunks: 1 }
+            if event.incarnation == "1785187982"
+                && event.event_type == "finish"
+                && event.name == "modules-final/config-scripts_user"
+                && event.vm_id.as_deref() == Some(CLOUD_INIT_VM_ID)
+                && event.uuid == "e5f01809-a7a3-4279-aa64-1f18e21eda6e"
+                && event.timestamp.as_deref()
+                    == Some("2026-07-27T21:33:24.339006+00:00")
+                && event.result.as_deref() == Some("SUCCESS")
+                && event.duration.is_some_and(|d| {
+                    (d - 0.000_644_859_000_001_218_9).abs() < 1e-12
+                })
+                && event.message
+                    == "config-scripts_user ran successfully and took \
+                        0.001 seconds"
+        ));
     }
 
     #[test]
     fn cloud_init_start_record_has_no_result_or_duration() {
         let value = r#"{"name":"modules-final/config-keys_to_console","type":"start","ts":"2026-07-27T21:33:24.344349+00:00","msg":"running config-keys_to_console with frequency once-per-instance"}"#;
         let key = "CLOUD_INIT|1785187982|start|modules-final/config-keys_to_console|0e5e179d-5341-478b-8456-fbb90621bdf8|7792621b-b339-4274-8b71-2a3dcbd2db4e";
-        match classify_record(key.to_string(), vec![value.to_string()]) {
-            DiagnosticRecord::CloudInit { event, .. } => {
-                assert_eq!(event.event_type, "start");
-                assert!(event.result.is_none());
-                assert!(event.duration.is_none());
-                assert_eq!(
-                    event.message,
-                    "running config-keys_to_console with frequency \
-                     once-per-instance"
-                );
+        assert_eq!(
+            classify_record(key.to_string(), vec![value.to_string()]),
+            DiagnosticRecord::CloudInit {
+                event: CloudInitEvent {
+                    incarnation: "1785187982".to_string(),
+                    event_type: "start".to_string(),
+                    name: "modules-final/config-keys_to_console".to_string(),
+                    vm_id: Some(CLOUD_INIT_VM_ID.to_string()),
+                    uuid: "7792621b-b339-4274-8b71-2a3dcbd2db4e".to_string(),
+                    timestamp: Some(
+                        "2026-07-27T21:33:24.344349+00:00".to_string()
+                    ),
+                    result: None,
+                    duration: None,
+                    message: "running config-keys_to_console with frequency \
+                               once-per-instance"
+                        .to_string(),
+                },
+                chunks: 1,
             }
-            other => panic!("expected cloud-init event, got {other:?}"),
-        }
+        );
     }
 
     #[test]
     fn cloud_init_key_with_invalid_json_is_malformed() {
-        match classify_record(
-            CLOUD_INIT_KEY_FINISH.to_string(),
-            vec!["not json".to_string()],
-        ) {
-            DiagnosticRecord::Malformed { reason, .. } => {
-                assert!(reason.contains("cloud-init"));
-            }
-            other => panic!("expected malformed, got {other:?}"),
-        }
+        assert!(matches!(
+            classify_record(
+                CLOUD_INIT_KEY_FINISH.to_string(),
+                vec!["not json".to_string()],
+            ),
+            DiagnosticRecord::Malformed { reason, .. }
+            if reason.contains("cloud-init")
+        ));
     }
 
     #[test]
@@ -1064,16 +1068,24 @@ mod tests {
         ];
 
         let records = reassemble(dumped);
-        assert_eq!(records.len(), 1);
-        match &records[0] {
-            DiagnosticRecord::CloudInit { event, chunks } => {
-                assert_eq!(*chunks, 3);
-                assert_eq!(event.message, "one two three");
-                assert_eq!(event.event_type, "finish");
-                assert_eq!(event.name, "modules-final/long");
-                assert_eq!(event.result.as_deref(), Some("SUCCESS"));
-            }
-            other => panic!("expected cloud-init event, got {other:?}"),
-        }
+        assert_eq!(
+            records,
+            vec![DiagnosticRecord::CloudInit {
+                event: CloudInitEvent {
+                    incarnation: "1785187982".to_string(),
+                    event_type: "finish".to_string(),
+                    name: "modules-final/long".to_string(),
+                    vm_id: Some(CLOUD_INIT_VM_ID.to_string()),
+                    uuid: "abc12345-1111-2222-3333-444455556666".to_string(),
+                    timestamp: Some(
+                        "2026-07-27T21:33:24.339006+00:00".to_string()
+                    ),
+                    result: Some("SUCCESS".to_string()),
+                    duration: Some(0.5),
+                    message: "one two three".to_string(),
+                },
+                chunks: 3,
+            }]
+        );
     }
 }
