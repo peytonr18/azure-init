@@ -100,22 +100,24 @@ enum Command {
         parse_diagnostics: bool,
         /// Also print raw (non-event) records such as PROVISIONING_REPORT.
         /// Only applies to the unfiltered view; --level/--name/--tail
-        /// produce an events-only view where raw records never appear.
+        /// produce an azure-init events-only view where raw records
+        /// never appear.
         #[arg(
             long,
             requires = "parse_diagnostics",
             conflicts_with_all = ["level", "name", "tail"]
         )]
         include_raw: bool,
-        /// Only show events at this level (error, warn, info, debug,
-        /// trace).
+        /// Only show azure-init events at this level (error, warn, info,
+        /// debug, trace).
         #[arg(long, requires = "parse_diagnostics")]
         level: Option<String>,
-        /// Only show events whose name contains this substring.
+        /// Only show azure-init events whose name contains this
+        /// substring.
         #[arg(long, requires = "parse_diagnostics")]
         name: Option<String>,
-        /// Print only the last COUNT events (default 20 when COUNT is
-        /// omitted).
+        /// Print only the last COUNT azure-init events (default 20 when
+        /// COUNT is omitted).
         #[arg(
             short = 'n',
             long = "tail",

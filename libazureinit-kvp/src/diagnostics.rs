@@ -512,10 +512,10 @@ impl DiagnosticsKvp {
             .collect())
     }
 
-    /// Remove every diagnostic key under a single lock: any key that
-    /// parses as an event key (including every `|<subevent_index>` chunk
-    /// of a multi-record event) or a malformed event key. Raw records
-    /// such as `PROVISIONING_REPORT` are left intact.
+    /// Remove every diagnostic key: any key that parses as an event key
+    /// (including every `|<subevent_index>` chunk of a multi-record event)
+    /// or a malformed event key. Raw records such as `PROVISIONING_REPORT`
+    /// are left intact.
     pub fn clear(&self) -> Result<(), KvpError> {
         let keys: Vec<String> = self
             .store
@@ -549,19 +549,25 @@ fn base_event_key(key: &str) -> &str {
 }
 
 /// Split a key into its base event key and optional trailing subevent
-/// index. A chunk key `<event-key>|<i>` returns `(<event-key>, Some(i))`;
-/// any other key (a single-record event, `PROVISIONING_REPORT`, a
-/// malformed key, …) returns `(key, None)`.
+/// index. When the trailing segment is numeric and the base parses as an
+/// event key — a valid azure-init or cloud-init event, or a malformed one
+/// (event-shaped but with an unrecognized level) — returns
+/// `(base, Some(index))`; any other key (a single-record event,
+/// `PROVISIONING_REPORT`, …) returns `(key, None)`.
 ///
 /// The subevent index is the same trailing `|<i>` cloud-init and
 /// azure-init append to give each chunk a unique key; [`reassemble`] uses
 /// it both to regroup an event's chunks and to restore their write order.
+/// Malformed keys are included so a chunked malformed event still
+/// regroups and is cleared consistently with a single-record one.
 fn split_subevent_index(key: &str) -> (&str, Option<u32>) {
     if let Some((base, index)) = key.rsplit_once(EVENT_KEY_DELIMITER) {
         if let Ok(index) = index.parse::<u32>() {
             if matches!(
                 classify_key(base),
-                KeyClass::Event { .. } | KeyClass::CloudInit { .. }
+                KeyClass::Event { .. }
+                    | KeyClass::CloudInit { .. }
+                    | KeyClass::Malformed { .. }
             ) {
                 return (base, Some(index));
             }
@@ -887,6 +893,7 @@ mod tests {
     #[case::raw_unchanged("PROVISIONING_REPORT", "PROVISIONING_REPORT")]
     #[case::non_event_numeric_tail_unchanged("foo|3", "foo|3")]
     #[case::malformed_unchanged("p|vm|NOPE|name|id", "p|vm|NOPE|name|id")]
+    #[case::malformed_indexed_chunk("p|vm|NOPE|name|id|0", "p|vm|NOPE|name|id")]
     fn base_event_key_strips_event_subevent_index(
         #[case] key: &str,
         #[case] expected: &str,

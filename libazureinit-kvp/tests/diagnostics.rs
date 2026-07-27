@@ -272,6 +272,10 @@ fn clear_removes_all_diagnostics_regardless_of_scope() {
         .append("other-agent|other-vm|INFO|x:y|id", "theirs")
         .unwrap();
     diag.store().append("p|vm|NOPE|c:d|id", "junk").unwrap();
+    // A chunked malformed event key (its base classifies as malformed) is
+    // also a diagnostic key, so clear() removes every chunk.
+    diag.store().append("p|vm|NOPE|c:d|id|0", "junk-0").unwrap();
+    diag.store().append("p|vm|NOPE|c:d|id|1", "junk-1").unwrap();
     // A raw record survives.
     diag.store()
         .append("PROVISIONING_REPORT", "result=success")
