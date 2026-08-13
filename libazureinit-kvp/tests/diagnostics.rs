@@ -9,8 +9,8 @@
 use std::thread;
 
 use libazureinit_kvp::{
-    DiagnosticEvent, DiagnosticRecord, DiagnosticsKvp, KvpPool, KvpPoolStore,
-    PoolMode, MAX_CHUNK_BYTES,
+    DiagnosticRecord, DiagnosticsKvp, KvpPool, KvpPoolStore, PoolMode,
+    MAX_CHUNK_BYTES,
 };
 use tempfile::TempDir;
 use tracing::Level;
@@ -100,9 +100,8 @@ fn short_event_round_trips_as_single_record() {
     assert_eq!(diag.vm_id(), VM_ID);
     assert_eq!(diag.event_prefix(), PREFIX);
 
-    let event =
-        DiagnosticEvent::new(Level::INFO, "user:create_user", "created");
-    diag.emit(&event).unwrap();
+    diag.emit(Level::INFO, "user:create_user", "created")
+        .unwrap();
 
     assert_eq!(diag.store().dump().unwrap().len(), 1);
 
@@ -114,9 +113,20 @@ fn short_event_round_trips_as_single_record() {
             chunks,
         } => {
             assert_eq!(*chunks, 1);
-            assert_eq!(decoded.level, Level::INFO);
+            assert_eq!(decoded.event_level, Level::INFO);
+            assert_eq!(decoded.vm_id, VM_ID);
+            assert_eq!(
+                decoded.boot_epoch_time,
+                diag.store().boot_epoch().unwrap()
+            );
             assert_eq!(decoded.name, "user:create_user");
-            assert_eq!(decoded.event_id, event.event_id);
+            let event_id = uuid::Uuid::parse_str(&decoded.event_id)
+                .expect("event_id should be a valid UUID");
+            assert_eq!(
+                event_id.get_version_num(),
+                4,
+                "event_id should be a UUIDv4"
+            );
             assert_eq!(decoded.message, "created");
         }
         other => panic!("expected event, got {other:?}"),
@@ -129,8 +139,7 @@ fn long_event_splits_across_records_and_reassembles() {
     let diag = diagnostics(&dir);
 
     let message = "x".repeat(MAX_CHUNK_BYTES * 3 + 50);
-    let event = DiagnosticEvent::new(Level::DEBUG, "config:dump", &message);
-    diag.emit(&event).unwrap();
+    diag.emit(Level::DEBUG, "config:dump", &message).unwrap();
 
     // Split across four records, each with a unique `|<subevent_index>`
     // key so the Hyper-V host (one record per key) keeps every chunk;
@@ -168,8 +177,7 @@ fn multi_chunk_event_uses_unique_keys_so_host_keeps_all() {
     let diag = diagnostics(&dir);
 
     let message = "z".repeat(MAX_CHUNK_BYTES * 2 + 1);
-    diag.emit(&DiagnosticEvent::new(Level::INFO, "big:event", &message))
-        .unwrap();
+    diag.emit(Level::INFO, "big:event", &message).unwrap();
 
     // Three records, no two sharing a key: the Hyper-V host keeps only one
     // record per key, so shared keys would silently drop chunks.
@@ -192,9 +200,9 @@ fn injected_malformed_key_is_classified() {
     let dir = TempDir::new().unwrap();
     let diag = diagnostics(&dir);
 
-    // Five segments but an unrecognized level.
+    // Six segments but an unrecognized level.
     diag.store()
-        .append(&format!("{PREFIX}|{VM_ID}|NOPE|bad:level|id"), "junk")
+        .append(&format!("{PREFIX}|100|NOPE|bad:level|{VM_ID}|id"), "junk")
         .unwrap();
 
     let records = diag.records().unwrap();
@@ -210,19 +218,14 @@ fn mixed_records_round_trip_together() {
     let dir = TempDir::new().unwrap();
     let diag = diagnostics(&dir);
 
-    diag.emit(&DiagnosticEvent::new(Level::INFO, "a:b", "short"))
+    diag.emit(Level::INFO, "a:b", "short").unwrap();
+    diag.emit(Level::WARN, "c:d", "y".repeat(MAX_CHUNK_BYTES + 5))
         .unwrap();
-    diag.emit(&DiagnosticEvent::new(
-        Level::WARN,
-        "c:d",
-        "y".repeat(MAX_CHUNK_BYTES + 5),
-    ))
-    .unwrap();
     diag.store()
         .append("PROVISIONING_REPORT", "result=success")
         .unwrap();
     diag.store()
-        .append(&format!("{PREFIX}|{VM_ID}|NOPE|e:f|id"), "junk")
+        .append(&format!("{PREFIX}|100|NOPE|e:f|{VM_ID}|id"), "junk")
         .unwrap();
 
     let records = diag.records().unwrap();
@@ -236,14 +239,9 @@ fn clear_removes_events_but_keeps_raw() {
     let dir = TempDir::new().unwrap();
     let diag = diagnostics(&dir);
 
-    diag.emit(&DiagnosticEvent::new(Level::INFO, "a:b", "e1"))
+    diag.emit(Level::INFO, "a:b", "e1").unwrap();
+    diag.emit(Level::DEBUG, "c:d", "z".repeat(MAX_CHUNK_BYTES * 2))
         .unwrap();
-    diag.emit(&DiagnosticEvent::new(
-        Level::DEBUG,
-        "c:d",
-        "z".repeat(MAX_CHUNK_BYTES * 2),
-    ))
-    .unwrap();
     diag.store()
         .append("PROVISIONING_REPORT", "result=success")
         .unwrap();
@@ -264,18 +262,21 @@ fn clear_removes_all_diagnostics_regardless_of_scope() {
     let dir = TempDir::new().unwrap();
     let diag = diagnostics(&dir);
 
-    diag.emit(&DiagnosticEvent::new(Level::INFO, "a:b", "mine"))
-        .unwrap();
+    diag.emit(Level::INFO, "a:b", "mine").unwrap();
     // Events from a different agent/VM and a malformed event key are also
     // diagnostic keys, so clear() removes them too.
     diag.store()
-        .append("other-agent|other-vm|INFO|x:y|id", "theirs")
+        .append("other-agent|100|INFO|x:y|other-vm|id", "theirs")
         .unwrap();
-    diag.store().append("p|vm|NOPE|c:d|id", "junk").unwrap();
+    diag.store().append("p|100|NOPE|c:d|vm|id", "junk").unwrap();
     // A chunked malformed event key (its base classifies as malformed) is
     // also a diagnostic key, so clear() removes every chunk.
-    diag.store().append("p|vm|NOPE|c:d|id|0", "junk-0").unwrap();
-    diag.store().append("p|vm|NOPE|c:d|id|1", "junk-1").unwrap();
+    diag.store()
+        .append("p|100|NOPE|c:d|vm|id|0", "junk-0")
+        .unwrap();
+    diag.store()
+        .append("p|100|NOPE|c:d|vm|id|1", "junk-1")
+        .unwrap();
     // A raw record survives.
     diag.store()
         .append("PROVISIONING_REPORT", "result=success")
@@ -297,9 +298,8 @@ fn emit_rejects_delimiter_in_event_fields() {
     let dir = TempDir::new().unwrap();
     let diag = diagnostics(&dir);
 
-    // A pipe in the name would produce an ambiguous six-segment key.
-    let event = DiagnosticEvent::new(Level::INFO, "a|b", "msg");
-    assert!(diag.emit(&event).is_err());
+    // A pipe in the name would produce an ambiguous seven-segment key.
+    assert!(diag.emit(Level::INFO, "a|b", "msg").is_err());
     // Nothing was written.
     assert!(diag.store().dump().unwrap().is_empty());
 }
@@ -321,12 +321,8 @@ fn concurrent_multichunk_emits_reassemble_without_interleaving() {
             thread::spawn(move || {
                 for _ in 0..PER_THREAD {
                     let message = marker.to_string().repeat(len);
-                    let event = DiagnosticEvent::new(
-                        Level::INFO,
-                        format!("thread:{marker}"),
-                        message,
-                    );
-                    diag.emit(&event).unwrap();
+                    diag.emit(Level::INFO, format!("thread:{marker}"), message)
+                        .unwrap();
                 }
             })
         })

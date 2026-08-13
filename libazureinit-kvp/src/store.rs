@@ -211,7 +211,9 @@ impl KvpPoolStore {
 
             let boot_time = boot_time(&*self.ops)?;
             lock_for_writing(&mut *handle)?;
-            if handle.metadata()?.mtime <= boot_time {
+            // Strict `<`: a file whose mtime equals boot time was written
+            // this boot (during the boot second), so it is not stale.
+            if handle.metadata()?.mtime < boot_time {
                 handle.set_len(0)?;
             }
         }
@@ -399,7 +401,20 @@ impl KvpPoolStore {
             Err(ref e) if e.kind() == ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e.into()),
         };
-        Ok(metadata.mtime <= boot_time(&*self.ops)?)
+        // Strict `<`: mtime == boot_time means the file was written this
+        // boot (during the boot second), so it is not stale.
+        Ok(metadata.mtime < boot_time(&*self.ops)?)
+    }
+
+    /// The system boot time as a Unix epoch timestamp in seconds, read
+    /// from `/proc/stat` `btime`.
+    ///
+    /// Diagnostic event keys stamp this value so records can be
+    /// attributed to a specific boot (mirroring cloud-init's
+    /// incarnation), letting readers tell this boot's telemetry from a
+    /// previous boot's.
+    pub fn boot_epoch(&self) -> Result<i64, KvpError> {
+        boot_time(&*self.ops)
     }
 
     /// Variant of [`is_stale`](Self::is_stale) that takes an explicit
@@ -412,7 +427,7 @@ impl KvpPoolStore {
             Err(ref e) if e.kind() == ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e.into()),
         };
-        Ok(metadata.mtime <= boot_time)
+        Ok(metadata.mtime < boot_time)
     }
 
     fn iter(&self) -> Result<KvpPoolIter, KvpError> {
@@ -3440,7 +3455,7 @@ mod tests {
 
     #[test]
     fn test_clear_if_stale_truncates_when_stale() {
-        // mtime (0) <= boot_time (10) → triggers set_len branch.
+        // mtime (0) < boot_time (10) → triggers set_len branch.
         let (store, ops, p) = mock_store(PoolMode::Safe);
         preload(&ops, &p, &[("a", "1")]);
         ops.set_boot_time(10);
@@ -3464,6 +3479,20 @@ mod tests {
         let (store, ops, p) = mock_store(PoolMode::Safe);
         ops.put_file(&p, vec![0u8; RECORD_SIZE], 10);
         ops.set_boot_time(5);
+        store.clear_if_stale().unwrap();
+        assert_eq!(ops.lock().files.get(&p).unwrap().len(), RECORD_SIZE);
+    }
+
+    #[test]
+    fn test_clear_if_stale_keeps_file_written_in_boot_second() {
+        // Boundary regression: mtime (10) == boot_time (10) means the
+        // file was written this boot (during the boot second), so it is
+        // NOT stale and must survive clear_if_stale (strict `<`).
+        let (store, ops, p) = mock_store(PoolMode::Safe);
+        ops.put_file(&p, vec![0u8; RECORD_SIZE], 10);
+        ops.set_boot_time(10);
+
+        assert!(!store.is_stale().unwrap());
         store.clear_if_stale().unwrap();
         assert_eq!(ops.lock().files.get(&p).unwrap().len(), RECORD_SIZE);
     }

@@ -305,11 +305,21 @@ fn dump_parse_diagnostics_json_reassembles_and_classifies() {
     // A two-chunk event (same key repeated) plus a raw record.
     assert_success(kvp(&with_dir(
         &dir,
-        &["write", "--append", "azure-init-x|vm|INFO|a:b|id1", "one/"],
+        &[
+            "write",
+            "--append",
+            "azure-init-x|100|INFO|a:b|vm|id1",
+            "one/",
+        ],
     )));
     assert_success(kvp(&with_dir(
         &dir,
-        &["write", "--append", "azure-init-x|vm|INFO|a:b|id1", "two"],
+        &[
+            "write",
+            "--append",
+            "azure-init-x|100|INFO|a:b|vm|id1",
+            "two",
+        ],
     )));
     assert_success(kvp(&with_dir(
         &dir,
@@ -409,11 +419,11 @@ fn dump_parse_diagnostics_filters_by_level() {
     let dir = TempDir::new().unwrap();
     assert_success(kvp(&with_dir(
         &dir,
-        &["write", "--append", "p|vm|INFO|a:b|i1", "info-msg"],
+        &["write", "--append", "p|100|INFO|a:b|vm|i1", "info-msg"],
     )));
     assert_success(kvp(&with_dir(
         &dir,
-        &["write", "--append", "p|vm|ERROR|c:d|i2", "err-msg"],
+        &["write", "--append", "p|100|ERROR|c:d|vm|i2", "err-msg"],
     )));
 
     let out = assert_success(kvp(&with_dir(
@@ -430,11 +440,11 @@ fn clear_diagnostics_removes_events_and_malformed_keeps_raw() {
     // An event, a malformed event key, and a raw record.
     assert_success(kvp(&with_dir(
         &dir,
-        &["write", "--append", "p|vm|INFO|a:b|i1", "msg"],
+        &["write", "--append", "p|100|INFO|a:b|vm|i1", "msg"],
     )));
     assert_success(kvp(&with_dir(
         &dir,
-        &["write", "--append", "p|vm|NOPE|c:d|i2", "junk"],
+        &["write", "--append", "p|100|NOPE|c:d|vm|i2", "junk"],
     )));
     assert_success(kvp(&with_dir(
         &dir,
@@ -460,11 +470,11 @@ fn dump_parse_diagnostics_text_renders_all_record_kinds() {
     let dir = TempDir::new().unwrap();
     assert_success(kvp(&with_dir(
         &dir,
-        &["write", "--append", "p|vm|INFO|a:b|id1", "one/"],
+        &["write", "--append", "p|100|INFO|a:b|vm|id1", "one/"],
     )));
     assert_success(kvp(&with_dir(
         &dir,
-        &["write", "--append", "p|vm|INFO|a:b|id1", "two"],
+        &["write", "--append", "p|100|INFO|a:b|vm|id1", "two"],
     )));
     assert_success(kvp(&with_dir(
         &dir,
@@ -472,7 +482,7 @@ fn dump_parse_diagnostics_text_renders_all_record_kinds() {
     )));
     assert_success(kvp(&with_dir(
         &dir,
-        &["write", "--append", "p|vm|NOPE|c:d|id2", "junk"],
+        &["write", "--append", "p|100|NOPE|c:d|vm|id2", "junk"],
     )));
 
     let out = assert_success(kvp(&with_dir(
@@ -480,10 +490,11 @@ fn dump_parse_diagnostics_text_renders_all_record_kinds() {
         &["dump", "--parse-diagnostics", "--include-raw"],
     )));
     assert!(out.contains(
-        "event level=INFO name=a:b event_id=id1 chunks=2 message=one/two"
+        "event boot_epoch_time=100 event_level=INFO name=a:b vm_id=vm \
+         event_id=id1 chunks=2 message=one/two"
     ));
     assert!(out.contains("raw key=PROVISIONING_REPORT value=result=success"));
-    assert!(out.contains("malformed key=p|vm|NOPE|c:d|id2"));
+    assert!(out.contains("malformed key=p|100|NOPE|c:d|vm|id2"));
     assert!(out.contains("value=junk"));
 }
 
@@ -492,11 +503,11 @@ fn dump_parse_diagnostics_tail_limits_to_last_events() {
     let dir = TempDir::new().unwrap();
     assert_success(kvp(&with_dir(
         &dir,
-        &["write", "--append", "p|vm|INFO|a:b|i1", "first"],
+        &["write", "--append", "p|100|INFO|a:b|vm|i1", "first"],
     )));
     assert_success(kvp(&with_dir(
         &dir,
-        &["write", "--append", "p|vm|INFO|c:d|i2", "second"],
+        &["write", "--append", "p|100|INFO|c:d|vm|i2", "second"],
     )));
 
     let out = assert_success(kvp(&with_dir(
@@ -516,7 +527,7 @@ fn dump_parse_diagnostics_tail_defaults_to_20_when_count_omitted() {
             &[
                 "write",
                 "--append",
-                &format!("p|vm|INFO|n:{i}|id{i}"),
+                &format!("p|100|INFO|n:{i}|vm|id{i}"),
                 &format!("msg{i}"),
             ],
         )));
@@ -538,11 +549,11 @@ fn dump_parse_diagnostics_filters_by_name_substring() {
     let dir = TempDir::new().unwrap();
     assert_success(kvp(&with_dir(
         &dir,
-        &["write", "--append", "p|vm|INFO|user:add|i1", "u"],
+        &["write", "--append", "p|100|INFO|user:add|vm|i1", "u"],
     )));
     assert_success(kvp(&with_dir(
         &dir,
-        &["write", "--append", "p|vm|INFO|ssh:key|i2", "s"],
+        &["write", "--append", "p|100|INFO|ssh:key|vm|i2", "s"],
     )));
 
     let out = assert_success(kvp(&with_dir(
@@ -584,11 +595,11 @@ fn dump_parse_diagnostics_json_covers_events_and_malformed() {
     let dir = TempDir::new().unwrap();
     assert_success(kvp(&with_dir(
         &dir,
-        &["write", "--append", "p|vm|INFO|a:b|i1", "hello"],
+        &["write", "--append", "p|100|INFO|a:b|vm|i1", "hello"],
     )));
     assert_success(kvp(&with_dir(
         &dir,
-        &["write", "--append", "p|vm|NOPE|c:d|i2", "junk"],
+        &["write", "--append", "p|100|NOPE|c:d|vm|i2", "junk"],
     )));
 
     let dump = assert_success(kvp(&with_dir(
@@ -606,4 +617,42 @@ fn dump_parse_diagnostics_json_covers_events_and_malformed() {
     )));
     assert!(events.contains("\"message\":\"hello\""));
     assert!(!events.contains("\"kind\":\"malformed\""));
+}
+
+#[test]
+fn emit_writes_event_readable_by_dump() {
+    let dir = TempDir::new().unwrap();
+    assert_success(kvp(&with_dir(
+        &dir,
+        &[
+            "emit",
+            "--level",
+            "info",
+            "--name",
+            "user:create_user",
+            "--message",
+            "created azureuser",
+            "--vm-id",
+            "vm-emit",
+            "--prefix",
+            "azure-init-test",
+        ],
+    )));
+
+    let out =
+        assert_success(kvp(&with_dir(&dir, &["dump", "--parse-diagnostics"])));
+    assert!(out.contains("event_level=INFO"));
+    assert!(out.contains("vm_id=vm-emit"));
+    assert!(out.contains("name=user:create_user"));
+    assert!(out.contains("message=created azureuser"));
+
+    // The JSON view exposes the same structured fields.
+    let json = assert_success(kvp(&with_dir(
+        &dir,
+        &["--json", "dump", "--parse-diagnostics"],
+    )));
+    assert!(json.contains("\"kind\":\"event\""));
+    assert!(json.contains("\"event_level\":\"INFO\""));
+    assert!(json.contains("\"vm_id\":\"vm-emit\""));
+    assert!(json.contains("\"name\":\"user:create_user\""));
 }

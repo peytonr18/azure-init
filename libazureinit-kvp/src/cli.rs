@@ -139,6 +139,26 @@ enum Command {
         key: String,
         value: String,
     },
+    /// Emit an azure-init diagnostic event: a structured KVP entry keyed
+    /// `<prefix>|<boot_epoch_time>|<event_level>|<name>|<vm_id>|<event_id>`.
+    /// Distinct from the raw `write` command.
+    Emit {
+        /// Event severity: error, warn, info, debug, or trace.
+        #[arg(long)]
+        level: String,
+        /// Event name, e.g. user:create_user.
+        #[arg(long)]
+        name: String,
+        /// Event message (stored as the record value).
+        #[arg(long)]
+        message: String,
+        /// VM identifier (defaults to the current VM's ID).
+        #[arg(long)]
+        vm_id: Option<String>,
+        /// Event-key prefix (defaults to the reporting agent identifier).
+        #[arg(long)]
+        prefix: Option<String>,
+    },
     /// Replace the pool from KEY=VALUE lines read from --file or stdin.
     Load {
         /// Read records from PATH instead of stdin.
@@ -289,6 +309,13 @@ fn dispatch<W: Write>(cli: Cli, stdout: &mut W) -> Result<u8, CliError> {
             }
             Ok(EXIT_OK)
         }
+        Command::Emit {
+            level,
+            name,
+            message,
+            vm_id,
+            prefix,
+        } => emit(&store, level, name, message, vm_id, prefix),
         Command::Load { file } => load(&store, file),
         Command::AppendMultiple { file } => append_multiple(&store, file),
         Command::Delete { key } => delete(&store, stdout, &key, output),
@@ -533,10 +560,12 @@ fn diagnostics_records<W: Write>(
             for record in &records {
                 let line = match record {
                     DiagnosticRecord::Event { event, chunks } => format!(
-                        "event level={} name={} event_id={} chunks={} \
-                         message={}",
-                        event.level,
+                        "event boot_epoch_time={} event_level={} name={} \
+                         vm_id={} event_id={} chunks={} message={}",
+                        event.boot_epoch_time,
+                        event.event_level,
                         event.name,
+                        event.vm_id,
                         event.event_id,
                         chunks,
                         event.message
@@ -601,7 +630,7 @@ fn diagnostics_events<W: Write>(
     let mut events = diagnostics.events()?;
 
     if let Some(level) = level {
-        events.retain(|event| event.level == level);
+        events.retain(|event| event.event_level == level);
     }
     if let Some(needle) = name.as_deref() {
         events.retain(|event| event.name.contains(needle));
@@ -615,8 +644,14 @@ fn diagnostics_events<W: Write>(
         OutputMode::Text => {
             for event in &events {
                 let line = format!(
-                    "event level={} name={} event_id={} message={}",
-                    event.level, event.name, event.event_id, event.message
+                    "event boot_epoch_time={} event_level={} name={} \
+                     vm_id={} event_id={} message={}",
+                    event.boot_epoch_time,
+                    event.event_level,
+                    event.name,
+                    event.vm_id,
+                    event.event_id,
+                    event.message
                 );
                 writeln!(stdout, "{line}")?;
             }
@@ -691,11 +726,30 @@ fn diagnostics_record_json(record: &DiagnosticRecord) -> serde_json::Value {
 fn diagnostics_event_json(event: &DiagnosticEvent) -> serde_json::Value {
     json!({
         "kind": "event",
-        "level": event.level.to_string(),
+        "boot_epoch_time": event.boot_epoch_time,
+        "event_level": event.event_level.to_string(),
         "name": event.name,
+        "vm_id": event.vm_id,
         "event_id": event.event_id,
         "message": event.message,
     })
+}
+
+/// Emit an azure-init diagnostic event with the given fields.
+fn emit(
+    store: &KvpPoolStore,
+    level: String,
+    name: String,
+    message: String,
+    vm_id: Option<String>,
+    prefix: Option<String>,
+) -> Result<u8, CliError> {
+    let level = parse_level_filter(&level)?;
+    let vm_id = resolve_vm_id(vm_id)?;
+    let prefix = prefix.unwrap_or_else(|| DEFAULT_AGENT.to_string());
+    let diagnostics = DiagnosticsKvp::new(store.clone(), vm_id, prefix);
+    diagnostics.emit(level, name, message)?;
+    Ok(EXIT_OK)
 }
 
 fn report_success(
