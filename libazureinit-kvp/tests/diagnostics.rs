@@ -10,10 +10,9 @@ use std::thread;
 
 use libazureinit_kvp::{
     DiagnosticRecord, DiagnosticsKvp, KvpPool, KvpPoolStore, PoolMode,
-    MAX_CHUNK_BYTES,
+    RecordKind, MAX_CHUNK_BYTES,
 };
 use tempfile::TempDir;
-use tracing::Level;
 
 const PREFIX: &str = "azure-init-test";
 const VM_ID: &str = "vm-abc";
@@ -52,21 +51,19 @@ fn reads_and_parses_real_cloud_init_pool() {
         store.append(key, value).unwrap();
     }
 
-    // A DiagnosticsKvp with no azure-init identity still reads cloud-init
-    // entries written by another agent.
     let diagnostics = DiagnosticsKvp::new(store, "", "");
     let records = diagnostics.records().unwrap();
     assert_eq!(records.len(), CLOUD_INIT_RECORDS.len());
 
-    // Every record decodes as a cloud-init event (none fall back to raw).
     for record in &records {
-        assert!(matches!(record, DiagnosticRecord::CloudInit { .. }));
+        assert!(matches!(record, DiagnosticRecord::Decoded { .. }));
     }
 
     match &records[0] {
-        DiagnosticRecord::CloudInit { event, chunks } => {
+        DiagnosticRecord::Decoded { event, chunks } => {
             assert_eq!(*chunks, 1);
-            assert_eq!(event.event_type, "finish");
+            assert_eq!(event.agent, "CLOUD_INIT");
+            assert_eq!(event.kind, RecordKind::Finish);
             assert_eq!(event.name, "modules-final/config-scripts_user");
             assert_eq!(
                 event.vm_id.as_deref(),
@@ -78,17 +75,16 @@ fn reads_and_parses_real_cloud_init_pool() {
                 "config-scripts_user ran successfully and took 0.001 seconds"
             );
         }
-        other => panic!("expected cloud-init event, got {other:?}"),
+        other => panic!("expected event, got {other:?}"),
     }
 
-    // A `start` event carries neither result nor duration.
     match &records[1] {
-        DiagnosticRecord::CloudInit { event, .. } => {
-            assert_eq!(event.event_type, "start");
+        DiagnosticRecord::Decoded { event, .. } => {
+            assert_eq!(event.kind, RecordKind::Start);
             assert!(event.result.is_none());
             assert!(event.duration.is_none());
         }
-        other => panic!("expected cloud-init event, got {other:?}"),
+        other => panic!("expected event, got {other:?}"),
     }
 }
 
@@ -98,27 +94,23 @@ fn short_event_round_trips_as_single_record() {
     let diag = diagnostics(&dir);
 
     assert_eq!(diag.vm_id(), VM_ID);
-    assert_eq!(diag.event_prefix(), PREFIX);
+    assert_eq!(diag.agent(), PREFIX);
 
-    diag.emit(Level::INFO, "user:create_user", "created")
-        .unwrap();
+    diag.emit_event("user:create_user", "created").unwrap();
 
     assert_eq!(diag.store().dump().unwrap().len(), 1);
 
     let records = diag.records().unwrap();
     assert_eq!(records.len(), 1);
     match &records[0] {
-        DiagnosticRecord::Event {
+        DiagnosticRecord::Decoded {
             event: decoded,
             chunks,
         } => {
             assert_eq!(*chunks, 1);
-            assert_eq!(decoded.event_level, Level::INFO);
-            assert_eq!(decoded.vm_id, VM_ID);
-            assert_eq!(
-                decoded.boot_epoch_time,
-                diag.store().boot_epoch().unwrap()
-            );
+            assert_eq!(decoded.kind, RecordKind::Event);
+            assert_eq!(decoded.vm_id.as_deref(), Some(VM_ID));
+            assert_eq!(decoded.boot_epoch, diag.store().boot_epoch().unwrap());
             assert_eq!(decoded.name, "user:create_user");
             let event_id = uuid::Uuid::parse_str(&decoded.event_id)
                 .expect("event_id should be a valid UUID");
@@ -139,11 +131,8 @@ fn long_event_splits_across_records_and_reassembles() {
     let diag = diagnostics(&dir);
 
     let message = "x".repeat(MAX_CHUNK_BYTES * 3 + 50);
-    diag.emit(Level::DEBUG, "config:dump", &message).unwrap();
+    diag.emit_event("config:dump", &message).unwrap();
 
-    // Split across four records, each with a unique `|<subevent_index>`
-    // key so the Hyper-V host (one record per key) keeps every chunk;
-    // they share one event-key base.
     let dumped = diag.store().dump().unwrap();
     assert_eq!(dumped.len(), 4);
     let base_of = |k: &str| k.rsplit_once('|').unwrap().0.to_string();
@@ -160,7 +149,7 @@ fn long_event_splits_across_records_and_reassembles() {
     let records = diag.records().unwrap();
     assert_eq!(records.len(), 1);
     match &records[0] {
-        DiagnosticRecord::Event {
+        DiagnosticRecord::Decoded {
             event: decoded,
             chunks,
         } => {
@@ -177,10 +166,8 @@ fn multi_chunk_event_uses_unique_keys_so_host_keeps_all() {
     let diag = diagnostics(&dir);
 
     let message = "z".repeat(MAX_CHUNK_BYTES * 2 + 1);
-    diag.emit(Level::INFO, "big:event", &message).unwrap();
+    diag.emit_event("big:event", &message).unwrap();
 
-    // Three records, no two sharing a key: the Hyper-V host keeps only one
-    // record per key, so shared keys would silently drop chunks.
     let dumped = diag.store().dump().unwrap();
     assert_eq!(dumped.len(), 3);
     let total = dumped.len();
@@ -189,7 +176,6 @@ fn multi_chunk_event_uses_unique_keys_so_host_keeps_all() {
     keys.dedup();
     assert_eq!(keys.len(), total, "chunk keys must be unique");
 
-    // The event still reassembles to the full message.
     let events = diag.events().unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].message, message);
@@ -200,9 +186,8 @@ fn injected_malformed_key_is_classified() {
     let dir = TempDir::new().unwrap();
     let diag = diagnostics(&dir);
 
-    // Six segments but an unrecognized level.
     diag.store()
-        .append(&format!("{PREFIX}|100|NOPE|bad:level|{VM_ID}|id"), "junk")
+        .append(&format!("{PREFIX}|100|{VM_ID}|NOPE|bad:kind|id|ts"), "junk")
         .unwrap();
 
     let records = diag.records().unwrap();
@@ -218,18 +203,17 @@ fn mixed_records_round_trip_together() {
     let dir = TempDir::new().unwrap();
     let diag = diagnostics(&dir);
 
-    diag.emit(Level::INFO, "a:b", "short").unwrap();
-    diag.emit(Level::WARN, "c:d", "y".repeat(MAX_CHUNK_BYTES + 5))
+    diag.emit_event("a:b", "short").unwrap();
+    diag.emit_event("c:d", "y".repeat(MAX_CHUNK_BYTES + 5))
         .unwrap();
     diag.store()
         .append("PROVISIONING_REPORT", "result=success")
         .unwrap();
     diag.store()
-        .append(&format!("{PREFIX}|100|NOPE|e:f|{VM_ID}|id"), "junk")
+        .append(&format!("{PREFIX}|100|{VM_ID}|NOPE|e:f|id|ts"), "junk")
         .unwrap();
 
     let records = diag.records().unwrap();
-    // Two events + one raw + one malformed.
     assert_eq!(records.len(), 4);
     assert_eq!(diag.events().unwrap().len(), 2);
 }
@@ -239,8 +223,8 @@ fn clear_removes_events_but_keeps_raw() {
     let dir = TempDir::new().unwrap();
     let diag = diagnostics(&dir);
 
-    diag.emit(Level::INFO, "a:b", "e1").unwrap();
-    diag.emit(Level::DEBUG, "c:d", "z".repeat(MAX_CHUNK_BYTES * 2))
+    diag.emit_event("a:b", "e1").unwrap();
+    diag.emit_event("c:d", "z".repeat(MAX_CHUNK_BYTES * 2))
         .unwrap();
     diag.store()
         .append("PROVISIONING_REPORT", "result=success")
@@ -262,22 +246,19 @@ fn clear_removes_all_diagnostics_regardless_of_scope() {
     let dir = TempDir::new().unwrap();
     let diag = diagnostics(&dir);
 
-    diag.emit(Level::INFO, "a:b", "mine").unwrap();
-    // Events from a different agent/VM and a malformed event key are also
-    // diagnostic keys, so clear() removes them too.
+    diag.emit_event("a:b", "mine").unwrap();
     diag.store()
-        .append("other-agent|100|INFO|x:y|other-vm|id", "theirs")
-        .unwrap();
-    diag.store().append("p|100|NOPE|c:d|vm|id", "junk").unwrap();
-    // A chunked malformed event key (its base classifies as malformed) is
-    // also a diagnostic key, so clear() removes every chunk.
-    diag.store()
-        .append("p|100|NOPE|c:d|vm|id|0", "junk-0")
+        .append("other-agent|100|other-vm|event|x:y|id|ts", "theirs")
         .unwrap();
     diag.store()
-        .append("p|100|NOPE|c:d|vm|id|1", "junk-1")
+        .append("p|100|vm|NOPE|c:d|id|ts", "junk")
         .unwrap();
-    // A raw record survives.
+    diag.store()
+        .append("p|100|vm|NOPE|c:d|id|ts|0", "junk-0")
+        .unwrap();
+    diag.store()
+        .append("p|100|vm|NOPE|c:d|id|ts|1", "junk-1")
+        .unwrap();
     diag.store()
         .append("PROVISIONING_REPORT", "result=success")
         .unwrap();
@@ -298,9 +279,7 @@ fn emit_rejects_delimiter_in_event_fields() {
     let dir = TempDir::new().unwrap();
     let diag = diagnostics(&dir);
 
-    // A pipe in the name would produce an ambiguous seven-segment key.
-    assert!(diag.emit(Level::INFO, "a|b", "msg").is_err());
-    // Nothing was written.
+    assert!(diag.emit_event("a|b", "msg").is_err());
     assert!(diag.store().dump().unwrap().is_empty());
 }
 
@@ -311,7 +290,6 @@ fn concurrent_multichunk_emits_reassemble_without_interleaving() {
 
     const THREADS: usize = 5;
     const PER_THREAD: usize = 8;
-    // Force three chunks per event.
     let len = MAX_CHUNK_BYTES * 2 + 7;
 
     let handles: Vec<_> = (0..THREADS)
@@ -321,7 +299,7 @@ fn concurrent_multichunk_emits_reassemble_without_interleaving() {
             thread::spawn(move || {
                 for _ in 0..PER_THREAD {
                     let message = marker.to_string().repeat(len);
-                    diag.emit(Level::INFO, format!("thread:{marker}"), message)
+                    diag.emit_event(format!("thread:{marker}"), message)
                         .unwrap();
                 }
             })
@@ -332,12 +310,8 @@ fn concurrent_multichunk_emits_reassemble_without_interleaving() {
     }
 
     let events = diag.events().unwrap();
-    // If any event's chunks had been split by an interleaving writer, the
-    // key would appear as multiple groups and the count would be wrong.
     assert_eq!(events.len(), THREADS * PER_THREAD);
     for event in &events {
-        // Each message is homogeneous and full length: chunks stayed
-        // contiguous on disk.
         assert_eq!(event.message.len(), len);
         let first = event.message.chars().next().unwrap();
         assert!(event.message.chars().all(|c| c == first));

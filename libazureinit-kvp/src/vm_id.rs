@@ -67,7 +67,7 @@ fn is_vm_gen1(
     let sysfs_efi = sysfs_efi_path.unwrap_or("/sys/firmware/efi");
     let dev_efi = dev_efi_path.unwrap_or("/dev/efi");
 
-    // If *either* efi path exists, this is Gen2; if *neither* exist, Gen1.
+    // If either efi path exists, this is Gen2; if neither exist, Gen1.
     !Path::new(sysfs_efi).exists() && !Path::new(dev_efi).exists()
 }
 
@@ -176,8 +176,6 @@ mod tests {
         let path = dir.path().join("product_uuid");
         fs::write(&path, "not-a-uuid").unwrap();
 
-        // Gen1 (no EFI paths) but the content cannot be parsed as a UUID,
-        // so the raw lowercased value is returned unchanged.
         let actual = private_get_vm_id(
             Some(path.to_str().unwrap()),
             Some("/nonexistent_sysfs_efi"),
@@ -190,9 +188,6 @@ mod tests {
 
     #[test]
     fn get_vm_id_public_wrapper_is_callable() {
-        // Exercises the public entry point. It reads the host's
-        // product_uuid if present, so the result is environment dependent;
-        // we only assert that invoking it does not panic.
         let _ = get_vm_id();
     }
 

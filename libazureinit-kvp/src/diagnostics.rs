@@ -5,31 +5,31 @@
 //! [`KvpPoolStore`](crate::KvpPoolStore) key/value API.
 //!
 //! Where [`KvpPoolStore`](crate::KvpPoolStore) treats keys and values as
-//! opaque bytes, [`DiagnosticsKvp`] understands the telemetry
-//! conventions azure-init writes into the guest pool:
+//! opaque bytes, [`DiagnosticsKvp`] understands the telemetry conventions
+//! azure-init writes into the guest pool and decodes cloud-init's
+//! reporting entries into the same [`DiagnosticEvent`] shape.
 //!
-//! - **Event keys** encode structured metadata as a six-segment,
+//! - **azure-init keys** encode metadata as a seven-segment,
 //!   pipe-delimited string
-//!   (`<prefix>|<boot_epoch_time>|<event_level>|<name>|<vm_id>|<event_id>`).
-//! - **Chunking**: a single KVP record caps the value at the store's
-//!   per-record limit (see [`MAX_CHUNK_BYTES`] for the safe-mode value).
-//!   Longer messages are split at UTF-8 codepoint boundaries into
-//!   multiple records written atomically under a single lock. Each chunk
-//!   gets a unique key — the event key with a `|<subevent_index>` suffix
-//!   (`<prefix>|<boot_epoch_time>|<event_level>|<name>|<vm_id>|<event_id>|<subevent_index>`),
-//!   matching cloud-init's naming — so the Hyper-V host, which keeps only
-//!   one record per key, retains every chunk. The chunks are regrouped
-//!   into one event on read.
+//!   (`<agent>|<boot_epoch>|<vm_id>|<kind>|<name>|<event_id>|<timestamp>`).
+//!   The value is the record's message string, stored verbatim for
+//!   every kind.
+//! - **cloud-init keys**
+//!   (`CLOUD_INIT|<incarnation>|<type>|<name>|[<vm_id>|]<uuid>`) store a
+//!   JSON value; the reader pulls `ts`/`result`/`duration`/`msg` from it
+//!   and takes everything else from the key, decoding into the same
+//!   [`DiagnosticEvent`]. This crate only *reads* cloud-init.
+//! - **Chunking**: values longer than [`MAX_CHUNK_BYTES`] are split at
+//!   UTF-8 codepoint boundaries into multiple records written atomically
+//!   under a single lock. Each chunk gets a unique key — the event key
+//!   with a `|<subevent_index>` suffix — so the Hyper-V host, which keeps
+//!   only one record per key, retains every chunk. The chunks are
+//!   regrouped into one event on read.
 //! - **Classification**: [`records`](DiagnosticsKvp::records) sorts every
 //!   stored record into a [`DiagnosticRecord`] — a reassembled
-//!   [`DiagnosticEvent`], an unstructured [`Raw`](DiagnosticRecord::Raw)
-//!   record such as `PROVISIONING_REPORT`, or a
-//!   [`Malformed`](DiagnosticRecord::Malformed) event key.
-//! - **cloud-init**: the reader also decodes cloud-init reporting entries
-//!   (keys prefixed `CLOUD_INIT` with a JSON value) into
-//!   [`CloudInitEvent`]s so the diagnostics CLI can display telemetry
-//!   from either provisioning agent. This crate only *reads* that
-//!   format; it does not write it.
+//!   [`DiagnosticEvent`] (from either agent), an unstructured
+//!   [`Raw`](DiagnosticRecord::Raw) record such as `PROVISIONING_REPORT`,
+//!   or a [`Malformed`](DiagnosticRecord::Malformed) event key.
 //!
 //! This module is policy only: all locking, size enforcement, and
 //! on-disk encoding stay in [`KvpPoolStore`](crate::KvpPoolStore).
@@ -40,7 +40,6 @@
 //! use libazureinit_kvp::{
 //!     DiagnosticsKvp, KvpPool, KvpPoolStore, PoolMode, MAX_CHUNK_BYTES,
 //! };
-//! use tracing::Level;
 //!
 //! # fn main() -> Result<(), libazureinit_kvp::KvpError> {
 //! let dir = std::env::temp_dir()
@@ -53,16 +52,11 @@
 //!     DiagnosticsKvp::new(store, "vm-1234", "azure-init-doc");
 //!
 //! // A short event lands in a single record.
-//! diagnostics.emit(
-//!     Level::INFO,
-//!     "user:create_user",
-//!     "Creating user azureuser",
-//! )?;
+//! diagnostics.emit_event("user:create_user", "Creating user azureuser")?;
 //!
-//! // A long message is split across records each with a unique
-//! // `|<subevent_index>`-suffixed key, and reassembled on read.
+//! // A long message is split across records and reassembled on read.
 //! let long = "x".repeat(MAX_CHUNK_BYTES * 2 + 10);
-//! diagnostics.emit(Level::DEBUG, "config:dump", &long)?;
+//! diagnostics.emit_event("config:dump", &long)?;
 //!
 //! let events = diagnostics.events()?;
 //! assert_eq!(events.len(), 2);
@@ -73,8 +67,7 @@
 //! # }
 //! ```
 
-use serde::Deserialize;
-use tracing::Level;
+use chrono::Utc;
 use uuid::Uuid;
 
 use crate::{KvpError, KvpPoolStore};
@@ -82,71 +75,116 @@ use crate::{KvpError, KvpPoolStore};
 /// Literal prefix identifying a cloud-init reporting KVP key.
 const CLOUD_INIT_PREFIX: &str = "CLOUD_INIT";
 
-/// Maximum number of value bytes per KVP record under
-/// [`PoolMode::Safe`](crate::PoolMode::Safe).
+/// Maximum number of value bytes per diagnostic KVP record.
 ///
-/// This matches a safe-mode store's
-/// [`KvpPoolStore::max_value_size`](crate::KvpPoolStore::max_value_size).
-/// [`DiagnosticsKvp::emit`] splits messages longer than the store's
-/// actual limit, so an [`Unsafe`](crate::PoolMode::Unsafe) store uses
-/// its larger capacity; this constant is the conservative reference
-/// value used throughout the diagnostics conventions.
+/// [`DiagnosticsKvp::emit_event`] splits messages longer than this into
+/// multiple records, regardless of the store's
+/// [`PoolMode`](crate::PoolMode). It is the conservative
+/// [`Safe`](crate::PoolMode::Safe) limit (2 bytes under the Linux kernel
+/// `HV_KVP_EXCHANGE_MAX_VALUE` maximum), so diagnostic records stay
+/// readable by the Hyper-V host even on an
+/// [`Unsafe`](crate::PoolMode::Unsafe) store — its larger capacity is
+/// deliberately not used for diagnostics.
 pub const MAX_CHUNK_BYTES: usize = 1022;
 
 /// Delimiter separating the segments of a diagnostic event key.
 const EVENT_KEY_DELIMITER: char = '|';
 
-/// Format a diagnostic event key as its `|`-delimited on-disk string:
-/// `<prefix>|<boot_epoch_time>|<event_level>|<name>|<vm_id>|<event_id>`.
+/// The kind of a diagnostic record: a span boundary (`start`/`finish`)
+/// or a point `event`. The `start`/`finish` tokens match cloud-init's,
+/// so a span's boundaries read the same whichever agent emitted them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordKind {
+    /// The opening of a span (a function or stage begins), written
+    /// `start`.
+    Start,
+    /// The closing of a span (a function or stage ends), written
+    /// `finish`.
+    Finish,
+    /// A point-in-time event, written `event`.
+    Event,
+}
+
+impl std::fmt::Display for RecordKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Start => "start",
+            Self::Finish => "finish",
+            Self::Event => "event",
+        })
+    }
+}
+
+/// Parses the on-disk `kind`/`type` token; cloud-init emits only
+/// `start`/`finish`.
+impl std::str::FromStr for RecordKind {
+    type Err = ();
+
+    fn from_str(token: &str) -> Result<Self, Self::Err> {
+        match token {
+            "start" => Ok(Self::Start),
+            "finish" => Ok(Self::Finish),
+            "event" => Ok(Self::Event),
+            _ => Err(()),
+        }
+    }
+}
+
+/// The current time as an ISO-8601 UTC timestamp (millisecond precision).
+fn now_timestamp() -> String {
+    Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+/// Format an azure-init diagnostic event key as its `|`-delimited on-disk
+/// string:
+/// `<agent>|<boot_epoch>|<vm_id>|<kind>|<name>|<event_id>|<timestamp>`.
 ///
-/// `boot_epoch_time` is the Unix epoch second the system booted (see
+/// `boot_epoch` is the Unix epoch second the system booted (see
 /// [`KvpPoolStore::boot_epoch`](crate::KvpPoolStore::boot_epoch)); it sits
-/// in the same slot as cloud-init's incarnation so the two agents' keys
-/// line up. The `event_level`/`name`/`vm_id` order likewise mirrors
-/// cloud-init's `type`/`name`/`vm_id` layout. [`classify_key`] is the
-/// inverse. For example:
+/// in the same slot as cloud-init's incarnation. `kind` records the
+/// span/event shape. [`classify_key`] is the inverse. For example:
 ///
 /// ```text
-/// azure-init-0.1.0|1785187982|INFO|user:create_user|3f2504e0-...|8f3e9c4a-...
+/// azure-init-0.1.0|1785187982|3f2504e0-...|event|user:create_user|8f3e9c4a-...|2026-07-27T21:33:24.300Z
 /// ```
 fn format_event_key(
-    prefix: &str,
-    boot_epoch_time: i64,
-    event_level: Level,
-    name: &str,
+    agent: &str,
+    boot_epoch: i64,
     vm_id: &str,
+    kind: RecordKind,
+    name: &str,
     event_id: &str,
+    timestamp: &str,
 ) -> String {
     let d = EVENT_KEY_DELIMITER;
     format!(
-        "{prefix}{d}{boot_epoch_time}{d}{event_level}{d}{name}{d}{vm_id}\
-         {d}{event_id}"
+        "{agent}{d}{boot_epoch}{d}{vm_id}{d}{kind}{d}{name}{d}{event_id}\
+         {d}{timestamp}"
     )
 }
-
-/// Outcome of inspecting a raw pool key.
 enum KeyClass<'a> {
-    /// The key is a well-formed azure-init event key.
     Event {
-        boot_epoch_time: i64,
-        event_level: Level,
-        name: &'a str,
+        agent: &'a str,
+        boot_epoch: i64,
         vm_id: &'a str,
+        kind: RecordKind,
+        name: &'a str,
         event_id: &'a str,
+        timestamp: &'a str,
     },
     /// The key is a well-formed cloud-init reporting event key
     /// (`CLOUD_INIT|<incarnation>|<type>|<name>|[<vm_id>|]<uuid>`).
     CloudInit {
-        incarnation: &'a str,
-        event_type: &'a str,
+        boot_epoch: i64,
+        kind: RecordKind,
         name: &'a str,
         vm_id: Option<&'a str>,
         uuid: &'a str,
     },
-    /// The key has the azure-init six-segment shape but is not a valid
-    /// event (for example, an unrecognized level).
-    Malformed { reason: String },
-    /// The key is not an event key (e.g. `PROVISIONING_REPORT`).
+    Malformed {
+        reason: String,
+    },
     Raw,
 }
 
@@ -156,19 +194,18 @@ fn classify_key(key: &str) -> KeyClass<'_> {
         return classify_cloud_init_key(key);
     }
 
-    // azure-init:
-    // `<prefix>|<boot_epoch_time>|<event_level>|<name>|<vm_id>|<event_id>`
     let mut segments = key.split(EVENT_KEY_DELIMITER);
-
-    // `str::split` always yields at least one element.
-    let _prefix = segments.next();
     let (
+        Some(agent),
         Some(boot_epoch),
-        Some(event_level),
-        Some(name),
         Some(vm_id),
+        Some(kind),
+        Some(name),
         Some(event_id),
+        Some(timestamp),
     ) = (
+        segments.next(),
+        segments.next(),
         segments.next(),
         segments.next(),
         segments.next(),
@@ -179,26 +216,25 @@ fn classify_key(key: &str) -> KeyClass<'_> {
         return KeyClass::Raw;
     };
     if segments.next().is_some() {
-        // More than six segments: a `|` leaked into a field.
         return KeyClass::Raw;
     }
 
-    // A non-numeric boot epoch means this is not an azure-init event key;
-    // keep it as an opaque record rather than a malformed event.
-    let Ok(boot_epoch_time) = boot_epoch.parse::<i64>() else {
+    let Ok(boot_epoch) = boot_epoch.parse::<i64>() else {
         return KeyClass::Raw;
     };
 
-    match event_level.parse::<Level>() {
-        Ok(event_level) => KeyClass::Event {
-            boot_epoch_time,
-            event_level,
-            name,
+    match kind.parse::<RecordKind>() {
+        Ok(kind) => KeyClass::Event {
+            agent,
+            boot_epoch,
             vm_id,
+            kind,
+            name,
             event_id,
+            timestamp,
         },
-        Err(_) => KeyClass::Malformed {
-            reason: format!("unrecognized level {event_level:?}"),
+        Err(()) => KeyClass::Malformed {
+            reason: format!("unrecognized kind {kind:?}"),
         },
     }
 }
@@ -209,11 +245,10 @@ fn classify_key(key: &str) -> KeyClass<'_> {
 /// (`CLOUD_INIT|<incarnation>|<type>|<name>|<vm_id>|<uuid>`) and the
 /// older one that predates the `vm_id` segment
 /// (`CLOUD_INIT|<incarnation>|<type>|<name>|<uuid>`). Any other segment
-/// count is treated as [`KeyClass::Raw`]. Parses by pulling segments
-/// from the iterator so no intermediate collection is allocated.
+/// count is [`KeyClass::Raw`]; a right-shaped key with a non-numeric
+/// incarnation or unrecognized type is [`KeyClass::Malformed`].
 fn classify_cloud_init_key(key: &str) -> KeyClass<'_> {
     let mut segments = key.split(EVENT_KEY_DELIMITER);
-    // The caller matched the `CLOUD_INIT` prefix; skip it.
     let _prefix = segments.next();
     let (Some(incarnation), Some(event_type), Some(name), Some(fourth)) = (
         segments.next(),
@@ -228,9 +263,21 @@ fn classify_cloud_init_key(key: &str) -> KeyClass<'_> {
         (Some(uuid), None) => (Some(fourth), uuid),
         _ => return KeyClass::Raw,
     };
+    let Ok(boot_epoch) = incarnation.parse::<i64>() else {
+        return KeyClass::Malformed {
+            reason: format!(
+                "non-numeric cloud-init incarnation {incarnation:?}"
+            ),
+        };
+    };
+    let Ok(kind) = event_type.parse::<RecordKind>() else {
+        return KeyClass::Malformed {
+            reason: format!("unrecognized cloud-init type {event_type:?}"),
+        };
+    };
     KeyClass::CloudInit {
-        incarnation,
-        event_type,
+        boot_epoch,
+        kind,
         name,
         vm_id,
         uuid,
@@ -258,13 +305,11 @@ fn chunk_at_char_boundary(value: &str, max_bytes: usize) -> Vec<&str> {
             break;
         }
 
-        // Walk back from the byte limit to the nearest codepoint boundary.
         let mut end = start + max_bytes;
         while end > start && !value.is_char_boundary(end) {
             end -= 1;
         }
         if end == start {
-            // One codepoint spans the whole window; take it whole.
             end = start + max_bytes + 1;
             while end < value.len() && !value.is_char_boundary(end) {
                 end += 1;
@@ -286,82 +331,52 @@ fn reject_delimiter(field: &'static str, value: &str) -> Result<(), KvpError> {
     Ok(())
 }
 
-/// A single azure-init diagnostic event — the decoded form of one
-/// azure-init KVP entry.
+/// A single diagnostic event — the decoded, source-agnostic form of one
+/// azure-init or cloud-init KVP entry.
 ///
-/// This is the crate's definition of what an azure-init KVP event looks
-/// like: the boot-scoped `boot_epoch_time`/`vm_id`, the event-scoped
-/// `event_level`/`name`/`event_id`, and the free-form `message`. Write one
-/// with [`DiagnosticsKvp::emit`] (which stamps the boot-scoped fields from
-/// the session and generates a fresh `event_id`); read events back, fully
-/// populated, via [`records`](DiagnosticsKvp::records) /
+/// Metadata (`agent`, `boot_epoch`, `vm_id`, `kind`, `name`, `event_id`)
+/// comes from the record key; the payload (`timestamp`, `result`,
+/// `duration`, `message`) comes from the value. Optional fields are
+/// populated only when the source provides them: azure-init events carry
+/// a `timestamp`; cloud-init `finish` records carry a `result` and
+/// `duration`. Write azure-init events with
+/// [`DiagnosticsKvp::emit_event`]; read events back via
+/// [`records`](DiagnosticsKvp::records) /
 /// [`events`](DiagnosticsKvp::events).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[non_exhaustive]
 pub struct DiagnosticEvent {
-    /// Unix epoch second the system booted, shared by every event of one
-    /// boot. Distinguishes this boot's telemetry from a previous boot's.
-    pub boot_epoch_time: i64,
-    /// Severity of the event.
-    pub event_level: Level,
-    /// Formatted event name, e.g. `user:create_user`.
-    pub name: String,
-    /// VM identifier the event was emitted under.
-    pub vm_id: String,
-    /// Per-emit identifier (UUIDv4); every chunk of one emitted event
-    /// shares this value.
-    pub event_id: String,
-    /// Literal value bytes written to the pool. The diagnostics layer
-    /// imposes no format on this string.
-    pub message: String,
-}
-
-/// The JSON payload cloud-init stores as a reporting event's KVP value.
-///
-/// Only the fields the diagnostics reader surfaces are deserialized;
-/// cloud-init also duplicates `name`/`type` here, but those are read
-/// from the key. Unknown fields are ignored.
-#[derive(Debug, Deserialize)]
-struct CloudInitValue {
-    /// Human-readable message; defaults to empty when absent.
-    #[serde(default)]
-    msg: String,
-    /// ISO-8601 timestamp.
-    ts: Option<String>,
-    /// Result string (e.g. `SUCCESS`), present on `finish` events.
-    result: Option<String>,
-    /// Duration in seconds, present on `finish` events.
-    duration: Option<f64>,
-}
-
-/// A single cloud-init reporting event decoded from a KVP entry.
-///
-/// cloud-init encodes routing metadata in the key
-/// (`CLOUD_INIT|<incarnation>|<type>|<name>|[<vm_id>|]<uuid>`) and the
-/// event details as a JSON value; this type is the decoded union of the
-/// two.
-#[derive(Clone, Debug, PartialEq)]
-#[non_exhaustive]
-pub struct CloudInitEvent {
-    /// Boot-time incarnation stamp from the key. cloud-init uses it to
-    /// distinguish this boot's records from a previous boot's.
-    pub incarnation: String,
-    /// Provisioning phase from the key, e.g. `start` or `finish`.
-    pub event_type: String,
-    /// Event name from the key, e.g. `modules-final/config-scripts_user`.
-    pub name: String,
+    /// Reporting agent identifier from the key, e.g. `azure-init-0.1.0`
+    /// or `CLOUD_INIT`; also distinguishes the record's source.
+    pub agent: String,
+    /// Unix epoch second the system booted (cloud-init's incarnation),
+    /// shared by every record of one boot.
+    pub boot_epoch: i64,
     /// VM identifier from the key. Absent in cloud-init builds that
     /// predate the `vm_id` key segment.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vm_id: Option<String>,
-    /// Per-event UUID from the key.
-    pub uuid: String,
-    /// ISO-8601 timestamp from the JSON value, if present.
+    /// Whether this record opens a span, closes a span, or is a point
+    /// event.
+    pub kind: RecordKind,
+    /// Formatted event or span name, e.g. `user:create_user`.
+    pub name: String,
+    /// Per-record identifier (azure-init's UUIDv4 / cloud-init's uuid);
+    /// every chunk of one record shares it, as do a span's start and
+    /// finish.
+    pub event_id: String,
+    /// ISO-8601 timestamp, if the source provides one.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
-    /// Result from the JSON value (e.g. `SUCCESS`), if present.
+    /// Result string (e.g. `SUCCESS`), present on cloud-init `finish`
+    /// records.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
-    /// Duration in seconds from the JSON value, if present.
+    /// Duration in seconds, present on cloud-init `finish` records.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<f64>,
-    /// Human-readable message from the JSON value.
+    /// Human-readable message. The diagnostics layer imposes no format
+    /// on this string.
     pub message: String,
 }
 
@@ -370,17 +385,10 @@ pub struct CloudInitEvent {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum DiagnosticRecord {
-    /// A reassembled azure-init diagnostic event.
-    Event {
+    /// A reassembled diagnostic event, from either agent.
+    Decoded {
         /// The decoded event.
         event: DiagnosticEvent,
-        /// Number of on-disk records the value spanned (1 when short).
-        chunks: usize,
-    },
-    /// A decoded cloud-init reporting event.
-    CloudInit {
-        /// The decoded cloud-init event.
-        event: CloudInitEvent,
         /// Number of on-disk records the value spanned (1 when short).
         chunks: usize,
     },
@@ -393,7 +401,7 @@ pub enum DiagnosticRecord {
         value: String,
     },
     /// A record whose key is event-shaped but is not a valid event (for
-    /// example, an unrecognized level or invalid cloud-init JSON).
+    /// example, an unrecognized kind or invalid cloud-init JSON).
     Malformed {
         /// The record key.
         key: String,
@@ -406,90 +414,98 @@ pub enum DiagnosticRecord {
 
 /// A typed diagnostics view over a [`KvpPoolStore`].
 ///
-/// Owns the event-key `prefix` and `vm_id` stamped into this layer's
-/// events by [`emit`](Self::emit). See the
-/// [module documentation](self) for the on-disk format.
+/// Owns the `agent` and `vm_id` stamped into this layer's azure-init
+/// event keys. See the [module documentation](self) for the on-disk
+/// format.
 #[derive(Clone, Debug)]
 pub struct DiagnosticsKvp {
     store: KvpPoolStore,
     vm_id: String,
-    event_prefix: String,
+    agent: String,
 }
 
 impl DiagnosticsKvp {
-    /// Wrap `store` with the `vm_id` and `event_prefix` stamped into
-    /// this layer's event keys.
     pub fn new(
         store: KvpPoolStore,
         vm_id: impl Into<String>,
-        event_prefix: impl Into<String>,
+        agent: impl Into<String>,
     ) -> Self {
         Self {
             store,
             vm_id: vm_id.into(),
-            event_prefix: event_prefix.into(),
+            agent: agent.into(),
         }
     }
-
-    /// The underlying store.
     pub fn store(&self) -> &KvpPoolStore {
         &self.store
     }
-
-    /// The VM identifier stamped into event keys.
     pub fn vm_id(&self) -> &str {
         &self.vm_id
     }
-
-    /// The prefix stamped into event keys.
-    pub fn event_prefix(&self) -> &str {
-        &self.event_prefix
+    pub fn agent(&self) -> &str {
+        &self.agent
     }
 
-    /// Emit an azure-init diagnostic event: format the key
-    /// `<prefix>|<boot_epoch_time>|<event_level>|<name>|<vm_id>|<event_id>`
-    /// and write `message` as its value. `boot_epoch_time` (from
-    /// [`KvpPoolStore::boot_epoch`](crate::KvpPoolStore::boot_epoch)),
-    /// `vm_id`, and `event_prefix` come from this layer; the `event_id` is
-    /// a fresh UUIDv4.
+    /// Emit an azure-init point event with `name` and `message`.
     ///
-    /// Messages longer than the store's per-record value limit are split
+    /// The `message` is stored verbatim as the record value. A fresh
+    /// `event_id` (UUIDv4) is generated.
+    pub fn emit_event(
+        &self,
+        name: impl Into<String>,
+        message: impl AsRef<str>,
+    ) -> Result<(), KvpError> {
+        let event_id = Uuid::new_v4().to_string();
+        self.write_event(
+            RecordKind::Event,
+            &event_id,
+            &name.into(),
+            message.as_ref(),
+        )
+    }
+
+    /// Format the key
+    /// `<agent>|<boot_epoch>|<vm_id>|<kind>|<name>|<event_id>|<timestamp>`
+    /// (stamping `boot_epoch`, `vm_id`, `agent`, and the current
+    /// `timestamp`) and write `value` as its message.
+    ///
+    /// Messages longer than [`MAX_CHUNK_BYTES`] are split
     /// at UTF-8 codepoint boundaries and written as multiple records
     /// atomically under a single lock via
-    /// [`KvpPoolStore::append_multiple`]. Each chunk is keyed by the event
-    /// key with a `|<subevent_index>` suffix so every record is unique —
-    /// the Hyper-V host keeps only one record per key — and the chunks are
-    /// regrouped by [`records`](Self::records) on read.
+    /// [`KvpPoolStore::append_multiple`]. Each chunk is keyed with a
+    /// `|<subevent_index>` suffix so every record is unique, and the
+    /// chunks are regrouped by [`records`](Self::records) on read.
     ///
-    /// Returns [`KvpError::EventFieldContainsDelimiter`] if the
-    /// `event_prefix`, `vm_id`, or `name` contains the `|` key delimiter,
-    /// which would make the key ambiguous to [`records`](Self::records).
-    pub fn emit(
+    /// Returns [`KvpError::EventFieldContainsDelimiter`] if `agent`,
+    /// `vm_id`, `name`, or `event_id` contains the `|` key delimiter.
+    fn write_event(
         &self,
-        event_level: Level,
-        name: impl Into<String>,
-        message: impl Into<String>,
+        kind: RecordKind,
+        event_id: &str,
+        name: &str,
+        value: &str,
     ) -> Result<(), KvpError> {
-        let name = name.into();
-        reject_delimiter("event_prefix", &self.event_prefix)?;
+        reject_delimiter("agent", &self.agent)?;
         reject_delimiter("vm_id", &self.vm_id)?;
-        reject_delimiter("name", &name)?;
+        reject_delimiter("name", name)?;
+        reject_delimiter("event_id", event_id)?;
 
-        let boot_epoch_time = self.store.boot_epoch()?;
-        let event_id = Uuid::new_v4().to_string();
+        let boot_epoch = self.store.boot_epoch()?;
+        let timestamp = now_timestamp();
         let key = format_event_key(
-            &self.event_prefix,
-            boot_epoch_time,
-            event_level,
-            &name,
+            &self.agent,
+            boot_epoch,
             &self.vm_id,
-            &event_id,
+            kind,
+            name,
+            event_id,
+            &timestamp,
         );
 
-        self.write_chunked(&key, &message.into())
+        self.write_chunked(&key, value)
     }
 
-    /// Split `value` at the store's per-record limit and append the
+    /// Split `value` at [`MAX_CHUNK_BYTES`] and append the
     /// chunks under `key` in one atomic batch.
     ///
     /// A single-record value keeps the bare event `key`. A value that
@@ -498,7 +514,7 @@ impl DiagnosticsKvp {
     /// the Hyper-V host keeps only one record per key. [`reassemble`]
     /// strips the subevent index to regroup the chunks on read.
     fn write_chunked(&self, key: &str, value: &str) -> Result<(), KvpError> {
-        let chunks = chunk_at_char_boundary(value, self.store.max_value_size());
+        let chunks = chunk_at_char_boundary(value, MAX_CHUNK_BYTES);
         if chunks.len() == 1 {
             return self
                 .store
@@ -521,28 +537,25 @@ impl DiagnosticsKvp {
     ///
     /// Records are returned in on-disk order. Consecutive records that
     /// share an event key — ignoring the `|<subevent_index>` suffix — are
-    /// one event; because [`emit`](Self::emit) writes an event's chunks
-    /// contiguously under a single lock, reassembly is correct even under
-    /// concurrent writers.
+    /// one event; because [`emit_event`](Self::emit_event) writes an
+    /// event's chunks contiguously under a single lock, reassembly is
+    /// correct even under concurrent writers.
     pub fn records(&self) -> Result<Vec<DiagnosticRecord>, KvpError> {
         Ok(reassemble(self.store.dump()?))
     }
 
-    /// Read back only the azure-init [`DiagnosticEvent`]s, in on-disk
-    /// order.
+    /// Read back every decoded [`DiagnosticEvent`], from either agent, in
+    /// on-disk order.
     ///
-    /// This deliberately excludes cloud-init events — which decode to the
-    /// separate [`CloudInitEvent`] type — as well as raw and malformed
-    /// records. Use [`records`](Self::records) for the full cross-agent
-    /// view that includes cloud-init telemetry.
+    /// Raw and malformed records are excluded. Use
+    /// [`records`](Self::records) for the full view that includes them.
     pub fn events(&self) -> Result<Vec<DiagnosticEvent>, KvpError> {
         Ok(self
             .records()?
             .into_iter()
             .filter_map(|record| match record {
-                DiagnosticRecord::Event { event, .. } => Some(event),
-                DiagnosticRecord::CloudInit { .. }
-                | DiagnosticRecord::Raw { .. }
+                DiagnosticRecord::Decoded { event, .. } => Some(event),
+                DiagnosticRecord::Raw { .. }
                 | DiagnosticRecord::Malformed { .. } => None,
             })
             .collect())
@@ -587,7 +600,7 @@ fn base_event_key(key: &str) -> &str {
 /// Split a key into its base event key and optional trailing subevent
 /// index. When the trailing segment is numeric and the base parses as an
 /// event key — a valid azure-init or cloud-init event, or a malformed one
-/// (event-shaped but with an unrecognized level) — returns
+/// (event-shaped but invalid) — returns
 /// `(base, Some(index))`; any other key (a single-record event,
 /// `PROVISIONING_REPORT`, …) returns `(key, None)`.
 ///
@@ -656,49 +669,63 @@ fn classify_record(key: String, chunk_values: Vec<String>) -> DiagnosticRecord {
     let chunks = chunk_values.len();
     match classify_key(&key) {
         KeyClass::Event {
-            boot_epoch_time,
-            event_level,
-            name,
+            agent,
+            boot_epoch,
             vm_id,
+            kind,
+            name,
             event_id,
-        } => DiagnosticRecord::Event {
-            event: DiagnosticEvent {
-                boot_epoch_time,
-                event_level,
-                name: name.to_string(),
-                vm_id: vm_id.to_string(),
-                event_id: event_id.to_string(),
-                message: chunk_values.concat(),
-            },
-            chunks,
-        },
+            timestamp,
+        } => {
+            let message = chunk_values.concat();
+            DiagnosticRecord::Decoded {
+                event: DiagnosticEvent {
+                    agent: agent.to_string(),
+                    boot_epoch,
+                    vm_id: Some(vm_id.to_string()),
+                    kind,
+                    name: name.to_string(),
+                    event_id: event_id.to_string(),
+                    timestamp: Some(timestamp.to_string()),
+                    result: None,
+                    duration: None,
+                    message,
+                },
+                chunks,
+            }
+        }
         KeyClass::CloudInit {
-            incarnation,
-            event_type,
+            boot_epoch,
+            kind,
             name,
             vm_id,
             uuid,
         } => {
             // Own the key-derived fields up front so `key` and
-            // `chunk_values` are free to move into a `Malformed` record
-            // when a chunk's value fails to decode.
-            let incarnation = incarnation.to_string();
-            let event_type = event_type.to_string();
+            // `chunk_values` can move into a `Malformed` record when a
+            // chunk's value fails to decode.
             let name = name.to_string();
             let vm_id = vm_id.map(str::to_string);
             let uuid = uuid.to_string();
             match decode_cloud_init_value(&chunk_values) {
-                Ok(decoded) => DiagnosticRecord::CloudInit {
-                    event: CloudInitEvent {
-                        incarnation,
-                        event_type,
-                        name,
+                Ok((meta, message)) => DiagnosticRecord::Decoded {
+                    event: DiagnosticEvent {
+                        agent: CLOUD_INIT_PREFIX.to_string(),
+                        boot_epoch,
                         vm_id,
-                        uuid,
-                        timestamp: decoded.timestamp,
-                        result: decoded.result,
-                        duration: decoded.duration,
-                        message: decoded.message,
+                        kind,
+                        name,
+                        event_id: uuid,
+                        timestamp: meta
+                            .get("ts")
+                            .and_then(|t| t.as_str())
+                            .map(str::to_string),
+                        result: meta
+                            .get("result")
+                            .and_then(|r| r.as_str())
+                            .map(str::to_string),
+                        duration: meta.get("duration").and_then(|d| d.as_f64()),
+                        message,
                     },
                     chunks,
                 },
@@ -721,21 +748,14 @@ fn classify_record(key: String, chunk_values: Vec<String>) -> DiagnosticRecord {
     }
 }
 
-/// The fields [`classify_record`] pulls from a cloud-init event's
-/// value(s): the reassembled `message` plus the metadata a `finish` event
-/// carries.
-struct DecodedCloudInit {
-    timestamp: Option<String>,
-    result: Option<String>,
-    duration: Option<f64>,
-    message: String,
-}
-
 /// Marker preceding a cloud-init value's message field: `"msg":"`.
 const CLOUD_INIT_MSG_MARKER: &str = "\"msg\":\"";
 
-/// Decode a cloud-init event's chunk value(s) into its metadata and full
-/// message.
+/// Decode a cloud-init event's chunk value(s) into its reassembled
+/// `message` and the JSON object carrying its `ts`/`result`/`duration`
+/// metadata, read from an untyped [`serde_json::Value`] so no serde
+/// deserialization target is needed. [`classify_record`] maps those
+/// fields onto the shared [`DiagnosticEvent`].
 ///
 /// A single-record event is a complete JSON object, parsed directly. A
 /// multi-record event was split by cloud-init's `_break_down`, which
@@ -747,42 +767,31 @@ const CLOUD_INIT_MSG_MARKER: &str = "\"msg\":\"";
 /// first chunk's non-`msg` fields.
 fn decode_cloud_init_value(
     chunks: &[String],
-) -> Result<DecodedCloudInit, String> {
+) -> Result<(serde_json::Value, String), String> {
     if let [only] = chunks {
-        let value: CloudInitValue =
+        let value: serde_json::Value =
             serde_json::from_str(only).map_err(|e| e.to_string())?;
-        return Ok(DecodedCloudInit {
-            timestamp: value.ts,
-            result: value.result,
-            duration: value.duration,
-            message: value.msg,
-        });
+        let message = value
+            .get("msg")
+            .and_then(|m| m.as_str())
+            .unwrap_or_default()
+            .to_string();
+        return Ok((value, message));
     }
 
-    // Concatenate each chunk's raw escaped `msg` slice, then unescape the
-    // reassembled string once so escapes split across chunks are rejoined
-    // first.
     let mut escaped = String::new();
     for chunk in chunks {
-        escaped.push_str(escaped_msg_slice(chunk)?);
+        escaped.push_str(cloud_init_escaped_msg_slice(chunk)?);
     }
     let message: String = serde_json::from_str(&format!("\"{escaped}\""))
         .map_err(|e| e.to_string())?;
 
-    // Metadata is identical across chunks; take it from the first, whose
-    // non-`msg` prefix is always valid JSON.
-    let meta = chunk_metadata(&chunks[0])?;
-    Ok(DecodedCloudInit {
-        timestamp: meta.ts,
-        result: meta.result,
-        duration: meta.duration,
-        message,
-    })
+    Ok((cloud_init_chunk_metadata(&chunks[0])?, message))
 }
 
 /// Recover a chunk's raw (still-escaped) `msg` slice — the bytes between
 /// the `"msg":"` marker and the closing `"}` — without unescaping.
-fn escaped_msg_slice(chunk: &str) -> Result<&str, String> {
+fn cloud_init_escaped_msg_slice(chunk: &str) -> Result<&str, String> {
     let start = chunk
         .find(CLOUD_INIT_MSG_MARKER)
         .ok_or("chunk is missing a \"msg\" field")?
@@ -796,10 +805,9 @@ fn escaped_msg_slice(chunk: &str) -> Result<&str, String> {
         .ok_or_else(|| "chunk \"msg\" field is malformed".to_string())
 }
 
-/// Parse a chunk's non-`msg` metadata (`ts`/`result`/`duration`) from the
-/// portion before its `,"msg":"` field. That prefix is always valid JSON
-/// even when the trailing `msg` slice is not.
-fn chunk_metadata(chunk: &str) -> Result<CloudInitValue, String> {
+/// Parse a chunk's non-`msg` prefix (the portion before its `,"msg":"`
+/// field, which is always valid JSON) into a [`serde_json::Value`].
+fn cloud_init_chunk_metadata(chunk: &str) -> Result<serde_json::Value, String> {
     let marker = format!(",{CLOUD_INIT_MSG_MARKER}");
     let end = chunk
         .find(&marker)
@@ -811,71 +819,74 @@ fn chunk_metadata(chunk: &str) -> Result<CloudInitValue, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{KvpPool, PoolMode};
     use rstest::rstest;
 
-    const PREFIX: &str = "azure-init-0.1.0";
+    const AGENT: &str = "azure-init-0.1.0";
     const VM_ID: &str = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
     const EVENT_ID: &str = "8f3e9c4a-1b2c-4d5e-9f01-234567890abc";
     const BOOT_EPOCH: i64 = 1_700_000_000;
+    const TIMESTAMP: &str = "2026-07-27T21:33:24.300Z";
 
     #[test]
     fn event_key_formats_and_classifies() {
         let formatted = format_event_key(
-            PREFIX,
+            AGENT,
             BOOT_EPOCH,
-            Level::INFO,
-            "user:create_user",
             VM_ID,
+            RecordKind::Event,
+            "user:create_user",
             EVENT_ID,
+            TIMESTAMP,
         );
         assert_eq!(
             formatted,
             format!(
-                "{PREFIX}|{BOOT_EPOCH}|INFO|user:create_user|{VM_ID}|\
-                 {EVENT_ID}"
+                "{AGENT}|{BOOT_EPOCH}|{VM_ID}|event|user:create_user|\
+                 {EVENT_ID}|{TIMESTAMP}"
             )
         );
         assert!(matches!(
             classify_key(&formatted),
             KeyClass::Event {
-                boot_epoch_time,
-                event_level,
-                name,
+                agent,
+                boot_epoch,
                 vm_id,
+                kind,
+                name,
                 event_id,
-            } if boot_epoch_time == BOOT_EPOCH
-                && event_level == Level::INFO
-                && name == "user:create_user"
+                timestamp,
+            } if agent == AGENT
+                && boot_epoch == BOOT_EPOCH
                 && vm_id == VM_ID
+                && kind == RecordKind::Event
+                && name == "user:create_user"
                 && event_id == EVENT_ID
+                && timestamp == TIMESTAMP
         ));
     }
 
     #[test]
-    fn classify_round_trips_every_level() {
-        for expected in [
-            Level::ERROR,
-            Level::WARN,
-            Level::INFO,
-            Level::DEBUG,
-            Level::TRACE,
-        ] {
+    fn classify_round_trips_every_kind() {
+        for expected in
+            [RecordKind::Start, RecordKind::Finish, RecordKind::Event]
+        {
             let key = format_event_key(
-                PREFIX,
+                AGENT,
                 BOOT_EPOCH,
+                VM_ID,
                 expected,
                 "span:event",
-                VM_ID,
                 EVENT_ID,
+                TIMESTAMP,
             );
             assert!(matches!(
                 classify_key(&key),
-                KeyClass::Event { event_level, .. } if event_level == expected
+                KeyClass::Event { kind, .. } if kind == expected
             ));
         }
     }
 
-    /// Map a key to its [`KeyClass`] discriminant for table-driven tests.
     fn class_of(key: &str) -> &'static str {
         match classify_key(key) {
             KeyClass::Event { .. } => "event",
@@ -886,17 +897,25 @@ mod tests {
     }
 
     #[rstest]
-    #[case::event("p|100|INFO|name|vm|id", "event")]
+    #[case::event("a|100|vm|event|name|id|ts", "event")]
     #[case::cloud_init(
         "CLOUD_INIT|1785187982|finish|name|vmid|uuid",
         "cloud-init"
     )]
     #[case::raw_single_segment("PROVISIONING_REPORT", "raw")]
-    #[case::raw_too_few_segments("a|b|INFO|c", "raw")]
-    #[case::raw_too_many_segments("a|100|b|INFO|c|d|e", "raw")]
-    #[case::raw_non_numeric_boot_epoch("p|notnum|INFO|name|vm|id", "raw")]
-    #[case::malformed_bad_level("p|100|NOTALEVEL|name|vm|id", "malformed")]
-    #[case::malformed_other_level("p|100|NOPE|name|vm|id", "malformed")]
+    #[case::raw_too_few_segments("a|100|vm|event|name|id", "raw")]
+    #[case::raw_too_many_segments("a|100|vm|event|name|id|ts|extra", "raw")]
+    #[case::raw_non_numeric_boot_epoch("a|notnum|vm|event|name|id|ts", "raw")]
+    #[case::malformed_bad_kind("a|100|vm|NOTAKIND|name|id|ts", "malformed")]
+    #[case::malformed_other_kind("a|100|vm|nope|name|id|ts", "malformed")]
+    #[case::cloud_init_bad_type(
+        "CLOUD_INIT|100|weird|name|vmid|uuid",
+        "malformed"
+    )]
+    #[case::cloud_init_non_numeric_incarnation(
+        "CLOUD_INIT|notnum|finish|name|vmid|uuid",
+        "malformed"
+    )]
     fn classify_key_categorizes(#[case] key: &str, #[case] expected: &str) {
         assert_eq!(class_of(key), expected);
     }
@@ -942,12 +961,13 @@ mod tests {
     #[test]
     fn reassemble_groups_chunks_and_classifies() {
         let key = format_event_key(
-            PREFIX,
+            AGENT,
             BOOT_EPOCH,
-            Level::INFO,
-            "config:dump",
             VM_ID,
+            RecordKind::Start,
+            "config:dump",
             EVENT_ID,
+            TIMESTAMP,
         );
 
         let dumped = vec![
@@ -957,7 +977,7 @@ mod tests {
                 "PROVISIONING_REPORT".to_string(),
                 "result=success".to_string(),
             ),
-            ("p|100|NOPE|name|vm|id".to_string(), "junk".to_string()),
+            ("a|100|vm|NOPE|name|id|ts".to_string(), "junk".to_string()),
         ];
 
         let records = reassemble(dumped);
@@ -965,13 +985,17 @@ mod tests {
 
         assert_eq!(
             records[0],
-            DiagnosticRecord::Event {
+            DiagnosticRecord::Decoded {
                 event: DiagnosticEvent {
-                    boot_epoch_time: BOOT_EPOCH,
-                    event_level: Level::INFO,
+                    agent: AGENT.to_string(),
+                    boot_epoch: BOOT_EPOCH,
+                    vm_id: Some(VM_ID.to_string()),
+                    kind: RecordKind::Start,
                     name: "config:dump".to_string(),
-                    vm_id: VM_ID.to_string(),
                     event_id: EVENT_ID.to_string(),
+                    timestamp: Some(TIMESTAMP.to_string()),
+                    result: None,
+                    duration: None,
                     message: "part-one/part-two".to_string(),
                 },
                 chunks: 2,
@@ -986,12 +1010,13 @@ mod tests {
     fn reassemble_keeps_distinct_adjacent_keys_separate() {
         let make = |event_id: &str| {
             format_event_key(
-                PREFIX,
+                AGENT,
                 BOOT_EPOCH,
-                Level::INFO,
-                "span:name",
                 VM_ID,
+                RecordKind::Start,
+                "span:name",
                 event_id,
+                TIMESTAMP,
             )
         };
         let dumped = vec![
@@ -1002,23 +1027,26 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert!(matches!(
             &records[0],
-            DiagnosticRecord::Event { chunks: 1, .. }
+            DiagnosticRecord::Decoded { chunks: 1, .. }
         ));
         assert!(matches!(
             &records[1],
-            DiagnosticRecord::Event { chunks: 1, .. }
+            DiagnosticRecord::Decoded { chunks: 1, .. }
         ));
     }
 
     #[rstest]
-    #[case::indexed_chunk("p|100|INFO|name|vm|id|0", "p|100|INFO|name|vm|id")]
+    #[case::indexed_chunk(
+        "a|100|vm|event|name|id|ts|0",
+        "a|100|vm|event|name|id|ts"
+    )]
     #[case::indexed_chunk_multi_digit(
-        "p|100|INFO|name|vm|id|12",
-        "p|100|INFO|name|vm|id"
+        "a|100|vm|event|name|id|ts|12",
+        "a|100|vm|event|name|id|ts"
     )]
     #[case::single_event_unchanged(
-        "p|100|INFO|name|vm|id",
-        "p|100|INFO|name|vm|id"
+        "a|100|vm|event|name|id|ts",
+        "a|100|vm|event|name|id|ts"
     )]
     #[case::cloud_init_indexed_chunk(
         "CLOUD_INIT|1785187982|finish|mod|vmid|uuid|0",
@@ -1027,12 +1055,12 @@ mod tests {
     #[case::raw_unchanged("PROVISIONING_REPORT", "PROVISIONING_REPORT")]
     #[case::non_event_numeric_tail_unchanged("foo|3", "foo|3")]
     #[case::malformed_unchanged(
-        "p|100|NOPE|name|vm|id",
-        "p|100|NOPE|name|vm|id"
+        "a|100|vm|NOPE|name|id|ts",
+        "a|100|vm|NOPE|name|id|ts"
     )]
     #[case::malformed_indexed_chunk(
-        "p|100|NOPE|name|vm|id|0",
-        "p|100|NOPE|name|vm|id"
+        "a|100|vm|NOPE|name|id|ts|0",
+        "a|100|vm|NOPE|name|id|ts"
     )]
     fn base_event_key_strips_event_subevent_index(
         #[case] key: &str,
@@ -1044,12 +1072,13 @@ mod tests {
     #[test]
     fn reassemble_groups_indexed_chunk_keys() {
         let base = format_event_key(
-            PREFIX,
+            AGENT,
             BOOT_EPOCH,
-            Level::INFO,
-            "config:dump",
             VM_ID,
+            RecordKind::Finish,
+            "config:dump",
             EVENT_ID,
+            TIMESTAMP,
         );
         let dumped = vec![
             (format!("{base}|0"), "part-one/".to_string()),
@@ -1061,13 +1090,17 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(
             records[0],
-            DiagnosticRecord::Event {
+            DiagnosticRecord::Decoded {
                 event: DiagnosticEvent {
-                    boot_epoch_time: BOOT_EPOCH,
-                    event_level: Level::INFO,
+                    agent: AGENT.to_string(),
+                    boot_epoch: BOOT_EPOCH,
+                    vm_id: Some(VM_ID.to_string()),
+                    kind: RecordKind::Finish,
                     name: "config:dump".to_string(),
-                    vm_id: VM_ID.to_string(),
                     event_id: EVENT_ID.to_string(),
+                    timestamp: Some(TIMESTAMP.to_string()),
+                    result: None,
+                    duration: None,
                     message: "part-one/part-two/part-three".to_string(),
                 },
                 chunks: 3,
@@ -1075,51 +1108,113 @@ mod tests {
         );
     }
 
-    // ---- cloud-init read support ----
+    #[test]
+    fn azure_event_value_is_full_message() {
+        let key = format_event_key(
+            AGENT,
+            BOOT_EPOCH,
+            VM_ID,
+            RecordKind::Event,
+            "user:create_user",
+            EVENT_ID,
+            TIMESTAMP,
+        );
+        assert!(matches!(
+            classify_record(key, vec!["boom".to_string()]),
+            DiagnosticRecord::Decoded { event, chunks: 1 }
+            if event.kind == RecordKind::Event
+                && event.message == "boom"
+                && event.agent == AGENT
+                && event.vm_id.as_deref() == Some(VM_ID)
+                && event.timestamp.as_deref() == Some(TIMESTAMP)
+        ));
+    }
+
+    #[test]
+    fn azure_span_value_is_full_message() {
+        let key = format_event_key(
+            AGENT,
+            BOOT_EPOCH,
+            VM_ID,
+            RecordKind::Finish,
+            "config:write",
+            EVENT_ID,
+            TIMESTAMP,
+        );
+        assert!(matches!(
+            classify_record(key, vec!["write_config completed".to_string()]),
+            DiagnosticRecord::Decoded { event, chunks: 1 }
+            if event.kind == RecordKind::Finish
+                && event.message == "write_config completed"
+        ));
+    }
+
+    #[test]
+    fn azure_span_start_finish_pair_round_trips_through_writer() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store =
+            KvpPoolStore::new_in(KvpPool::Guest, dir.path(), PoolMode::Safe)
+                .unwrap();
+        let diag = DiagnosticsKvp::new(store, VM_ID, AGENT);
+
+        // A span emits a start and a finish sharing one event_id.
+        diag.write_event(
+            RecordKind::Start,
+            EVENT_ID,
+            "provision:run",
+            "starting provision",
+        )
+        .unwrap();
+        diag.write_event(
+            RecordKind::Finish,
+            EVENT_ID,
+            "provision:run",
+            "provision completed",
+        )
+        .unwrap();
+
+        let events = diag.events().unwrap();
+        assert_eq!(events.len(), 2);
+
+        assert_eq!(events[0].kind, RecordKind::Start);
+        assert_eq!(events[0].message, "starting provision");
+        assert_eq!(events[1].kind, RecordKind::Finish);
+        assert_eq!(events[1].message, "provision completed");
+
+        for event in &events {
+            assert_eq!(event.event_id, EVENT_ID);
+            assert_eq!(event.name, "provision:run");
+            assert_eq!(event.agent, AGENT);
+            assert_eq!(event.vm_id.as_deref(), Some(VM_ID));
+        }
+    }
 
     const CLOUD_INIT_VM_ID: &str = "0e5e179d-5341-478b-8456-fbb90621bdf8";
     const CLOUD_INIT_KEY_FINISH: &str = "CLOUD_INIT|1785187982|finish|modules-final/config-scripts_user|0e5e179d-5341-478b-8456-fbb90621bdf8|e5f01809-a7a3-4279-aa64-1f18e21eda6e";
     const CLOUD_INIT_VALUE_FINISH: &str = r#"{"name":"modules-final/config-scripts_user","type":"finish","ts":"2026-07-27T21:33:24.339006+00:00","result":"SUCCESS","duration":0.0006448590000012189,"msg":"config-scripts_user ran successfully and took 0.001 seconds"}"#;
 
-    #[rstest]
-    #[case::with_vm_id(
-        CLOUD_INIT_KEY_FINISH,
-        "1785187982",
-        "finish",
-        "modules-final/config-scripts_user",
-        Some(CLOUD_INIT_VM_ID),
-        "e5f01809-a7a3-4279-aa64-1f18e21eda6e"
-    )]
-    // Older cloud-init builds omit the vm_id key segment.
-    #[case::without_vm_id(
-        "CLOUD_INIT|1785187982|start|modules-config/foo|c4d4a08d-fe93-4c7a-9be6-9a38c212e212",
-        "1785187982",
-        "start",
-        "modules-config/foo",
-        None,
-        "c4d4a08d-fe93-4c7a-9be6-9a38c212e212"
-    )]
-    fn cloud_init_key_classifies(
-        #[case] key: &str,
-        #[case] incarnation: &str,
-        #[case] event_type: &str,
-        #[case] name: &str,
-        #[case] vm_id: Option<&str>,
-        #[case] uuid: &str,
-    ) {
+    #[test]
+    fn cloud_init_key_classifies() {
         assert!(matches!(
-            classify_key(key),
-            KeyClass::CloudInit {
-                incarnation: i,
-                event_type: t,
-                name: n,
-                vm_id: v,
-                uuid: u,
-            } if i == incarnation
-                && t == event_type
-                && n == name
-                && v == vm_id
-                && u == uuid
+            classify_key(CLOUD_INIT_KEY_FINISH),
+            KeyClass::CloudInit { boot_epoch, kind, name, vm_id, uuid }
+            if boot_epoch == 1785187982
+                && kind == RecordKind::Finish
+                && name == "modules-final/config-scripts_user"
+                && vm_id == Some(CLOUD_INIT_VM_ID)
+                && uuid == "e5f01809-a7a3-4279-aa64-1f18e21eda6e"
+        ));
+        assert!(matches!(
+            classify_key(
+                "CLOUD_INIT|1785187982|start|modules-config/foo|\
+                 c4d4a08d-fe93-4c7a-9be6-9a38c212e212"
+            ),
+            KeyClass::CloudInit { boot_epoch, kind, name, vm_id, uuid }
+            if boot_epoch == 1785187982
+                && kind == RecordKind::Start
+                && name == "modules-config/foo"
+                && vm_id.is_none()
+                && uuid == "c4d4a08d-fe93-4c7a-9be6-9a38c212e212"
         ));
     }
 
@@ -1136,19 +1231,18 @@ mod tests {
 
     #[test]
     fn cloud_init_finish_record_decodes_all_fields() {
-        // A single `matches!` covers every field (with a tolerance on the
-        // float duration) and leaves no unreachable arm to cover.
         assert!(matches!(
             classify_record(
                 CLOUD_INIT_KEY_FINISH.to_string(),
                 vec![CLOUD_INIT_VALUE_FINISH.to_string()],
             ),
-            DiagnosticRecord::CloudInit { event, chunks: 1 }
-            if event.incarnation == "1785187982"
-                && event.event_type == "finish"
+            DiagnosticRecord::Decoded { event, chunks: 1 }
+            if event.agent == "CLOUD_INIT"
+                && event.boot_epoch == 1785187982
+                && event.kind == RecordKind::Finish
                 && event.name == "modules-final/config-scripts_user"
                 && event.vm_id.as_deref() == Some(CLOUD_INIT_VM_ID)
-                && event.uuid == "e5f01809-a7a3-4279-aa64-1f18e21eda6e"
+                && event.event_id == "e5f01809-a7a3-4279-aa64-1f18e21eda6e"
                 && event.timestamp.as_deref()
                     == Some("2026-07-27T21:33:24.339006+00:00")
                 && event.result.as_deref() == Some("SUCCESS")
@@ -1167,13 +1261,15 @@ mod tests {
         let key = "CLOUD_INIT|1785187982|start|modules-final/config-keys_to_console|0e5e179d-5341-478b-8456-fbb90621bdf8|7792621b-b339-4274-8b71-2a3dcbd2db4e";
         assert_eq!(
             classify_record(key.to_string(), vec![value.to_string()]),
-            DiagnosticRecord::CloudInit {
-                event: CloudInitEvent {
-                    incarnation: "1785187982".to_string(),
-                    event_type: "start".to_string(),
-                    name: "modules-final/config-keys_to_console".to_string(),
+            DiagnosticRecord::Decoded {
+                event: DiagnosticEvent {
+                    agent: "CLOUD_INIT".to_string(),
+                    boot_epoch: 1785187982,
                     vm_id: Some(CLOUD_INIT_VM_ID.to_string()),
-                    uuid: "7792621b-b339-4274-8b71-2a3dcbd2db4e".to_string(),
+                    kind: RecordKind::Start,
+                    name: "modules-final/config-keys_to_console".to_string(),
+                    event_id: "7792621b-b339-4274-8b71-2a3dcbd2db4e"
+                        .to_string(),
                     timestamp: Some(
                         "2026-07-27T21:33:24.344349+00:00".to_string()
                     ),
@@ -1203,9 +1299,6 @@ mod tests {
     #[test]
     fn cloud_init_chunks_reassemble_by_subevent_index() {
         let base = "CLOUD_INIT|1785187982|finish|modules-final/long|0e5e179d-5341-478b-8456-fbb90621bdf8|abc12345-1111-2222-3333-444455556666";
-        // Each chunk carries its own `|<subevent_index>` key suffix and a
-        // message slice. They are laid out on disk out of order to prove
-        // reassembly restores order by that index, not disk position.
         let chunk = |i: u32, msg: &str| {
             format!(
                 r#"{{"name":"modules-final/long","type":"finish","ts":"2026-07-27T21:33:24.339006+00:00","result":"SUCCESS","duration":0.5,"msg_i":{i},"msg":"{msg}"}}"#
@@ -1220,13 +1313,15 @@ mod tests {
         let records = reassemble(dumped);
         assert_eq!(
             records,
-            vec![DiagnosticRecord::CloudInit {
-                event: CloudInitEvent {
-                    incarnation: "1785187982".to_string(),
-                    event_type: "finish".to_string(),
-                    name: "modules-final/long".to_string(),
+            vec![DiagnosticRecord::Decoded {
+                event: DiagnosticEvent {
+                    agent: "CLOUD_INIT".to_string(),
+                    boot_epoch: 1785187982,
                     vm_id: Some(CLOUD_INIT_VM_ID.to_string()),
-                    uuid: "abc12345-1111-2222-3333-444455556666".to_string(),
+                    kind: RecordKind::Finish,
+                    name: "modules-final/long".to_string(),
+                    event_id: "abc12345-1111-2222-3333-444455556666"
+                        .to_string(),
                     timestamp: Some(
                         "2026-07-27T21:33:24.339006+00:00".to_string()
                     ),
@@ -1241,12 +1336,6 @@ mod tests {
 
     #[test]
     fn cloud_init_chunks_reassemble_split_json_escape() {
-        // Regression: cloud-init's `_break_down` re-emits the metadata
-        // (plus a `msg_i` chunk index) on every chunk and slices the
-        // JSON-escaped message at character boundaries, so a `\n` escape
-        // can straddle two chunks — the first ends in a lone backslash and
-        // is not valid JSON on its own. The reader must rejoin the raw
-        // slices before unescaping.
         let base = "CLOUD_INIT|1785187982|finish|modules-final/x|0e5e179d-5341-478b-8456-fbb90621bdf8|abc12345-1111-2222-3333-444455556666";
         let dumped = vec![
             (
@@ -1264,7 +1353,7 @@ mod tests {
         let records = reassemble(dumped);
         assert!(matches!(
             &records[..],
-            [DiagnosticRecord::CloudInit { event, chunks: 2 }]
+            [DiagnosticRecord::Decoded { event, chunks: 2 }]
             if event.message == "line1\nline2"
                 && event.result.as_deref() == Some("SUCCESS")
                 && event.duration == Some(0.5)

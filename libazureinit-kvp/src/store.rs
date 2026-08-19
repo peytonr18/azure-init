@@ -211,8 +211,6 @@ impl KvpPoolStore {
 
             let boot_time = boot_time(&*self.ops)?;
             lock_for_writing(&mut *handle)?;
-            // Strict `<`: a file whose mtime equals boot time was written
-            // this boot (during the boot second), so it is not stale.
             if handle.metadata()?.mtime < boot_time {
                 handle.set_len(0)?;
             }
@@ -401,8 +399,6 @@ impl KvpPoolStore {
             Err(ref e) if e.kind() == ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e.into()),
         };
-        // Strict `<`: mtime == boot_time means the file was written this
-        // boot (during the boot second), so it is not stale.
         Ok(metadata.mtime < boot_time(&*self.ops)?)
     }
 
@@ -537,8 +533,6 @@ impl KvpPoolStore {
         iter.flush()?;
         Ok(())
     }
-
-    /// Return a reference to the pool file path.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -1374,7 +1368,6 @@ mod tests {
 
         assert_eq!(store.read(&long_key).unwrap(), Some("val".to_string()));
 
-        // Read is not size-capped: an oversized key simply misses.
         let too_long = "k".repeat(513);
         assert_eq!(store.read(&too_long).unwrap(), None);
     }
@@ -1675,7 +1668,6 @@ mod tests {
 
         assert!(store.delete("k4").unwrap());
 
-        // k9 takes k4's slot; the rest stays put.
         assert_eq!(
             store.dump().unwrap(),
             pairs([
@@ -1769,7 +1761,6 @@ mod tests {
         let store = safe_store(dir.path());
         store.load(pairs([("keep", "me")])).unwrap();
 
-        // Bad record mid-batch: file must be untouched on rejection.
         let bad_value = "v".repeat(1023);
         let err = store
             .load(vec![
@@ -1794,7 +1785,6 @@ mod tests {
         let err = store.load(too_many).unwrap_err();
         assert!(is_max_keys(&err), "got {err:?}");
 
-        // Cap is checked pre-lock; the file is never opened.
         assert!(!store.path().exists());
     }
 
@@ -1803,7 +1793,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = safe_store(dir.path());
 
-        // 2 * MAX_UNIQUE_KEYS records, MAX_UNIQUE_KEYS unique keys.
         let mut records: Vec<(String, String)> = (0..MAX_UNIQUE_KEYS)
             .map(|i| (format!("k{i}"), "a".to_string()))
             .collect();
@@ -1828,7 +1817,6 @@ mod tests {
         let err = store.insert("overflow", "v").unwrap_err();
         assert!(is_max_keys(&err), "got {err:?}");
 
-        // Overwriting an existing key at the cap still works.
         store.insert("k0", "updated").unwrap();
         assert_eq!(store.read("k0").unwrap(), Some("updated".to_string()));
     }
@@ -1864,14 +1852,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = safe_store(dir.path());
 
-        // Mirrors the chunked-event use case: many records sharing a
-        // single key, written atomically.
         let records =
             pairs([("chunk", "part1"), ("chunk", "part2"), ("chunk", "part3")]);
         store.append_multiple(records.clone()).unwrap();
 
         assert_eq!(store.dump().unwrap(), records);
-        // `read` returns last-write-wins; entries() collapses to 1.
         assert_eq!(store.entries().unwrap().len(), 1);
     }
 
@@ -1884,7 +1869,6 @@ mod tests {
             .append_multiple(Vec::<(String, String)>::new())
             .unwrap();
 
-        // No file created when the input is empty.
         assert!(!store.path().exists());
     }
 
@@ -1904,8 +1888,6 @@ mod tests {
             .unwrap_err();
         assert!(is_value_too_large(&err), "got {err:?}");
 
-        // Rejection is all-or-nothing: previously-written records
-        // are untouched, none of the new batch lands.
         assert_eq!(store.dump().unwrap(), pairs([("keep", "me")]));
     }
 
@@ -1934,16 +1916,11 @@ mod tests {
 
     #[test]
     fn test_append_multiple_does_not_enforce_unique_key_cap() {
-        // Matches `append`'s contract: the bulk variant deliberately
-        // skips the unique-key cap so chunked writes (many records
-        // sharing one key) cannot accidentally trip it.
         let dir = TempDir::new().unwrap();
         let store = safe_store(dir.path());
 
         seed_unique_keys(&store, MAX_UNIQUE_KEYS);
 
-        // Adding a new unique key via append_multiple is allowed even
-        // when the pool is already at the cap.
         store.append_multiple(pairs([("extra", "v")])).unwrap();
         assert_eq!(store.len().unwrap(), MAX_UNIQUE_KEYS + 1);
     }
@@ -1973,7 +1950,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = safe_store(dir.path());
 
-        // Two unique keys, three matching records.
         store
             .load(pairs([
                 ("k", "v1"),
@@ -2022,7 +1998,6 @@ mod tests {
         let removed = store.delete_multiple(Vec::<String>::new()).unwrap();
         assert_eq!(removed, 0);
 
-        // Empty input never opens or creates the file.
         assert!(!store.path().exists());
     }
 
@@ -2043,8 +2018,6 @@ mod tests {
 
         store.load(pairs([("a", "1"), ("b", "2")])).unwrap();
 
-        // Listing the same key twice still removes the (one) record
-        // exactly once.
         let removed = store.delete_multiple(vec!["a", "a", "a"]).unwrap();
         assert_eq!(removed, 1);
         assert_eq!(store.dump().unwrap(), pairs([("b", "2")]));
@@ -2061,7 +2034,6 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, KvpError::EmptyKey), "got {err:?}");
 
-        // Validation runs before any record is removed.
         assert_eq!(store.dump().unwrap(), pairs([("a", "1")]));
     }
 
@@ -2078,8 +2050,6 @@ mod tests {
 
     #[test]
     fn test_delete_multiple_size_independent_of_mode() {
-        // Mirrors `delete`'s contract: keys longer than the safe-mode
-        // cap can be removed from a safe-mode store.
         let dir = TempDir::new().unwrap();
         let store_unsafe = unsafe_store(dir.path());
         let long_key = "k".repeat(SAFE_MAX_KEY_BYTES + 1);
@@ -3078,21 +3048,14 @@ mod tests {
         let store = safe_store(dir.path());
         store.load(pairs([("a", "1"), ("b", "2")])).unwrap();
 
-        // Open a mutable iterator (exclusive lock) so we can manipulate the file.
         let mut iter = store.iter_mut().unwrap();
         assert_eq!(iter.record_count(), 2);
 
-        // Read the first record successfully.
         let (k, _) = iter.next().unwrap().unwrap();
         assert_eq!(k, "a");
 
-        // Truncate via the iterator's own handle to remove the second record.
-        // The iterator still thinks record_count == 2, so the next
-        // read_exact will hit an unexpected EOF.
         iter.handle.set_len(0).unwrap();
 
-        // The iterator's cached record_count (2) > current_index (1),
-        // so it attempts read_exact, which fails.
         let err = iter.next().unwrap().unwrap_err();
         assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
     }
@@ -3360,12 +3323,15 @@ mod tests {
     fn is_io(e: &KvpError) -> bool {
         matches!(e, KvpError::Io(_))
     }
+
     fn is_max_keys(e: &KvpError) -> bool {
         matches!(e, KvpError::MaxUniqueKeysExceeded { .. })
     }
+
     fn is_value_too_large(e: &KvpError) -> bool {
         matches!(e, KvpError::ValueTooLarge { .. })
     }
+
     fn is_key_too_large(e: &KvpError) -> bool {
         matches!(e, KvpError::KeyTooLarge { .. })
     }
@@ -3455,7 +3421,6 @@ mod tests {
 
     #[test]
     fn test_clear_if_stale_truncates_when_stale() {
-        // mtime (0) < boot_time (10) → triggers set_len branch.
         let (store, ops, p) = mock_store(PoolMode::Safe);
         preload(&ops, &p, &[("a", "1")]);
         ops.set_boot_time(10);
@@ -3485,9 +3450,6 @@ mod tests {
 
     #[test]
     fn test_clear_if_stale_keeps_file_written_in_boot_second() {
-        // Boundary regression: mtime (10) == boot_time (10) means the
-        // file was written this boot (during the boot second), so it is
-        // NOT stale and must survive clear_if_stale (strict `<`).
         let (store, ops, p) = mock_store(PoolMode::Safe);
         ops.put_file(&p, vec![0u8; RECORD_SIZE], 10);
         ops.set_boot_time(10);

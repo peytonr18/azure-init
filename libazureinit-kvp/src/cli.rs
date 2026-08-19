@@ -99,19 +99,14 @@ enum Command {
         #[arg(long)]
         parse_diagnostics: bool,
         /// Also print raw (non-event) records such as PROVISIONING_REPORT.
-        /// Only applies to the unfiltered view; --level/--name/--tail
-        /// produce an azure-init events-only view where raw records
-        /// never appear.
+        /// Only applies to the unfiltered view; --name/--tail produce an
+        /// azure-init events-only view where raw records never appear.
         #[arg(
             long,
             requires = "parse_diagnostics",
-            conflicts_with_all = ["level", "name", "tail"]
+            conflicts_with_all = ["name", "tail"]
         )]
         include_raw: bool,
-        /// Only show azure-init events at this level (error, warn, info,
-        /// debug, trace).
-        #[arg(long, requires = "parse_diagnostics")]
-        level: Option<String>,
         /// Only show azure-init events whose name contains this
         /// substring.
         #[arg(long, requires = "parse_diagnostics")]
@@ -140,12 +135,9 @@ enum Command {
         value: String,
     },
     /// Emit an azure-init diagnostic event: a structured KVP entry keyed
-    /// `<prefix>|<boot_epoch_time>|<event_level>|<name>|<vm_id>|<event_id>`.
+    /// `<agent>|<boot_epoch>|<vm_id>|<kind>|<name>|<event_id>|<timestamp>`.
     /// Distinct from the raw `write` command.
     Emit {
-        /// Event severity: error, warn, info, debug, or trace.
-        #[arg(long)]
-        level: String,
         /// Event name, e.g. user:create_user.
         #[arg(long)]
         name: String,
@@ -287,13 +279,11 @@ fn dispatch<W: Write>(cli: Cli, stdout: &mut W) -> Result<u8, CliError> {
         Command::Dump {
             parse_diagnostics,
             include_raw,
-            level,
             name,
             tail,
         } => {
             let parse = parse_diagnostics.then_some(ParseDiagnosticsArgs {
                 include_raw,
-                level,
                 name,
                 tail,
             });
@@ -310,12 +300,11 @@ fn dispatch<W: Write>(cli: Cli, stdout: &mut W) -> Result<u8, CliError> {
             Ok(EXIT_OK)
         }
         Command::Emit {
-            level,
             name,
             message,
             vm_id,
             prefix,
-        } => emit(&store, level, name, message, vm_id, prefix),
+        } => emit(&store, name, message, vm_id, prefix),
         Command::Load { file } => load(&store, file),
         Command::AppendMultiple { file } => append_multiple(&store, file),
         Command::Delete { key } => delete(&store, stdout, &key, output),
@@ -399,11 +388,8 @@ fn info<W: Write>(
     }
     Ok(EXIT_OK)
 }
-
-/// Options for the `dump --parse-diagnostics` view; absent for a raw dump.
 struct ParseDiagnosticsArgs {
     include_raw: bool,
-    level: Option<String>,
     name: Option<String>,
     tail: Option<usize>,
 }
@@ -415,18 +401,9 @@ fn dump<W: Write>(
     output: OutputMode,
 ) -> Result<u8, CliError> {
     if let Some(parse) = parse {
-        // --level/--name/--tail select the decoded events-only view;
-        // otherwise every record is shown (raw hidden unless
-        // --include-raw).
-        if parse.level.is_some() || parse.name.is_some() || parse.tail.is_some()
-        {
+        if parse.name.is_some() || parse.tail.is_some() {
             return diagnostics_events(
-                store,
-                stdout,
-                parse.level,
-                parse.name,
-                parse.tail,
-                output,
+                store, stdout, parse.name, parse.tail, output,
             );
         }
         return diagnostics_records(store, stdout, parse.include_raw, output);
@@ -559,38 +536,12 @@ fn diagnostics_records<W: Write>(
         OutputMode::Text => {
             for record in &records {
                 let line = match record {
-                    DiagnosticRecord::Event { event, chunks } => format!(
-                        "event boot_epoch_time={} event_level={} name={} \
-                         vm_id={} event_id={} chunks={} message={}",
-                        event.boot_epoch_time,
-                        event.event_level,
-                        event.name,
-                        event.vm_id,
-                        event.event_id,
-                        chunks,
-                        event.message
-                    ),
-                    DiagnosticRecord::CloudInit { event, chunks } => {
-                        let mut line = format!(
-                            "cloud-init-event type={} name={} uuid={}",
-                            event.event_type, event.name, event.uuid
-                        );
-                        if let Some(vm_id) = &event.vm_id {
-                            let _ = write!(line, " vm_id={vm_id}");
-                        }
-                        if let Some(result) = &event.result {
-                            let _ = write!(line, " result={result}");
-                        }
-                        if let Some(ts) = &event.timestamp {
-                            let _ = write!(line, " ts={ts}");
-                        }
-                        if let Some(duration) = event.duration {
-                            let _ = write!(line, " duration={duration}");
-                        }
+                    DiagnosticRecord::Decoded { event, chunks } => {
+                        let mut line = diagnostics_event_text(event);
                         let _ = write!(
                             line,
-                            " incarnation={} chunks={} message={}",
-                            event.incarnation, chunks, event.message
+                            " chunks={chunks} message={}",
+                            event.message
                         );
                         line
                     }
@@ -619,19 +570,13 @@ fn diagnostics_records<W: Write>(
 fn diagnostics_events<W: Write>(
     store: &KvpPoolStore,
     stdout: &mut W,
-    level: Option<String>,
     name: Option<String>,
     tail: Option<usize>,
     output: OutputMode,
 ) -> Result<u8, CliError> {
-    let level = level.as_deref().map(parse_level_filter).transpose()?;
-
     let diagnostics = DiagnosticsKvp::new(store.clone(), "", "");
     let mut events = diagnostics.events()?;
 
-    if let Some(level) = level {
-        events.retain(|event| event.event_level == level);
-    }
     if let Some(needle) = name.as_deref() {
         events.retain(|event| event.name.contains(needle));
     }
@@ -643,16 +588,8 @@ fn diagnostics_events<W: Write>(
     match output {
         OutputMode::Text => {
             for event in &events {
-                let line = format!(
-                    "event boot_epoch_time={} event_level={} name={} \
-                     vm_id={} event_id={} message={}",
-                    event.boot_epoch_time,
-                    event.event_level,
-                    event.name,
-                    event.vm_id,
-                    event.event_id,
-                    event.message
-                );
+                let mut line = diagnostics_event_text(event);
+                let _ = write!(line, " message={}", event.message);
                 writeln!(stdout, "{line}")?;
             }
         }
@@ -665,56 +602,47 @@ fn diagnostics_events<W: Write>(
     Ok(EXIT_OK)
 }
 
-/// Parse a `--level` filter argument into a [`tracing::Level`].
-fn parse_level_filter(level: &str) -> Result<tracing::Level, CliError> {
-    level.parse::<tracing::Level>().map_err(|_| {
-        CliError::Usage(format!(
-            "invalid level '{level}' (expected error, warn, info, debug, \
-             or trace)"
-        ))
-    })
+/// Render a [`DiagnosticEvent`] as a single text line of `key=value`
+/// fields, omitting optional fields the source did not provide.
+fn diagnostics_event_text(event: &DiagnosticEvent) -> String {
+    let mut line = format!(
+        "event kind={} agent={} boot_epoch={}",
+        event.kind, event.agent, event.boot_epoch
+    );
+    if let Some(vm_id) = &event.vm_id {
+        let _ = write!(line, " vm_id={vm_id}");
+    }
+    let _ = write!(line, " name={} event_id={}", event.name, event.event_id);
+    if let Some(ts) = &event.timestamp {
+        let _ = write!(line, " timestamp={ts}");
+    }
+    if let Some(result) = &event.result {
+        let _ = write!(line, " result={result}");
+    }
+    if let Some(duration) = event.duration {
+        let _ = write!(line, " duration={duration}");
+    }
+    line
 }
 
 /// Render a [`DiagnosticRecord`] as a JSON object.
 fn diagnostics_record_json(record: &DiagnosticRecord) -> serde_json::Value {
     match record {
-        DiagnosticRecord::Event { event, chunks } => {
+        DiagnosticRecord::Decoded { event, chunks } => {
             let mut value = diagnostics_event_json(event);
             if let serde_json::Value::Object(map) = &mut value {
+                map.insert("record".to_string(), json!("event"));
                 map.insert("chunks".to_string(), json!(chunks));
             }
             value
         }
-        DiagnosticRecord::CloudInit { event, chunks } => {
-            let mut map = serde_json::Map::new();
-            map.insert("kind".to_string(), json!("cloud-init-event"));
-            map.insert("incarnation".to_string(), json!(event.incarnation));
-            map.insert("type".to_string(), json!(event.event_type));
-            map.insert("name".to_string(), json!(event.name));
-            if let Some(vm_id) = &event.vm_id {
-                map.insert("vm_id".to_string(), json!(vm_id));
-            }
-            map.insert("uuid".to_string(), json!(event.uuid));
-            if let Some(ts) = &event.timestamp {
-                map.insert("ts".to_string(), json!(ts));
-            }
-            if let Some(result) = &event.result {
-                map.insert("result".to_string(), json!(result));
-            }
-            if let Some(duration) = event.duration {
-                map.insert("duration".to_string(), json!(duration));
-            }
-            map.insert("chunks".to_string(), json!(chunks));
-            map.insert("message".to_string(), json!(event.message));
-            serde_json::Value::Object(map)
-        }
         DiagnosticRecord::Raw { key, value } => json!({
-            "kind": "raw",
+            "record": "raw",
             "key": key,
             "value": value,
         }),
         DiagnosticRecord::Malformed { key, value, reason } => json!({
-            "kind": "malformed",
+            "record": "malformed",
             "key": key,
             "value": value,
             "reason": reason,
@@ -722,33 +650,25 @@ fn diagnostics_record_json(record: &DiagnosticRecord) -> serde_json::Value {
     }
 }
 
-/// Render a [`DiagnosticEvent`] as a JSON object (without chunk count).
+/// Render a [`DiagnosticEvent`] as a JSON object (without chunk count),
+/// omitting optional fields the source did not provide.
 fn diagnostics_event_json(event: &DiagnosticEvent) -> serde_json::Value {
-    json!({
-        "kind": "event",
-        "boot_epoch_time": event.boot_epoch_time,
-        "event_level": event.event_level.to_string(),
-        "name": event.name,
-        "vm_id": event.vm_id,
-        "event_id": event.event_id,
-        "message": event.message,
-    })
+    serde_json::to_value(event)
+        .expect("DiagnosticEvent always serializes to a JSON object")
 }
 
 /// Emit an azure-init diagnostic event with the given fields.
 fn emit(
     store: &KvpPoolStore,
-    level: String,
     name: String,
     message: String,
     vm_id: Option<String>,
     prefix: Option<String>,
 ) -> Result<u8, CliError> {
-    let level = parse_level_filter(&level)?;
     let vm_id = resolve_vm_id(vm_id)?;
     let prefix = prefix.unwrap_or_else(|| DEFAULT_AGENT.to_string());
     let diagnostics = DiagnosticsKvp::new(store.clone(), vm_id, prefix);
-    diagnostics.emit(level, name, message)?;
+    diagnostics.emit_event(name, message)?;
     Ok(EXIT_OK)
 }
 
@@ -1103,7 +1023,6 @@ mod tests {
         Command::Dump {
             parse_diagnostics: false,
             include_raw: false,
-            level: None,
             name: None,
             tail: None,
         }
@@ -1673,7 +1592,6 @@ mod tests {
         assert!(dumped.contains("b=two"));
 
         let (_, entries) = run_dispatch(cli(&dir, Command::Entries));
-        // entries are sorted by key
         assert_eq!(entries, "a=one\nb=two\n");
     }
 
