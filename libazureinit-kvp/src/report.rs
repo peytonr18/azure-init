@@ -55,9 +55,7 @@ impl std::fmt::Display for ReportResult {
 /// Pre-provisioning (PPS) type reported in the `pps_type` field.
 ///
 /// Mirrors the values cloud-init reports for the platform's
-/// `PreprovisionedVMType` / IMDS `ppsType`. Marked `#[non_exhaustive]`
-/// so new platform PPS types can be added without breaking downstream
-/// `match` statements.
+/// `PreprovisionedVMType` / IMDS `ppsType`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReportPpsType {
     /// Not pre-provisioned (`None`).

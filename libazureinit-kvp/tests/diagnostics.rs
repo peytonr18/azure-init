@@ -98,7 +98,9 @@ fn short_event_round_trips_as_single_record() {
 
     diag.emit_event("user:create_user", "created").unwrap();
 
-    assert_eq!(diag.store().dump().unwrap().len(), 1);
+    let dumped = diag.store().dump().unwrap();
+    assert_eq!(dumped.len(), 1);
+    assert!(dumped[0].0.ends_with("|0"), "key: {}", dumped[0].0);
 
     let records = diag.records().unwrap();
     assert_eq!(records.len(), 1);

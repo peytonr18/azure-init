@@ -20,11 +20,10 @@
 //!   and takes everything else from the key, decoding into the same
 //!   [`DiagnosticEvent`]. This crate only *reads* cloud-init.
 //! - **Chunking**: values longer than [`MAX_CHUNK_BYTES`] are split at
-//!   UTF-8 codepoint boundaries into multiple records written atomically
-//!   under a single lock. Each chunk gets a unique key — the event key
-//!   with a `|<subevent_index>` suffix — so the Hyper-V host, which keeps
-//!   only one record per key, retains every chunk. The chunks are
-//!   regrouped into one event on read.
+//!   UTF-8 codepoint boundaries into multiple records under one lock,
+//!   each keyed with a unique `|<subevent_index>` suffix (`0`, `1`, …)
+//!   since the Hyper-V host keeps only one record per key. Chunks are
+//!   regrouped on read.
 //! - **Classification**: [`records`](DiagnosticsKvp::records) sorts every
 //!   stored record into a [`DiagnosticRecord`] — a reassembled
 //!   [`DiagnosticEvent`] (from either agent), an unstructured
@@ -136,8 +135,8 @@ fn now_timestamp() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
-/// Format an azure-init diagnostic event key as its `|`-delimited on-disk
-/// string:
+/// Format an azure-init diagnostic event's *shared* key as its
+/// `|`-delimited on-disk string:
 /// `<agent>|<boot_epoch>|<vm_id>|<kind>|<name>|<event_id>|<timestamp>`.
 ///
 /// `boot_epoch` is the Unix epoch second the system booted (see
@@ -336,13 +335,9 @@ fn reject_delimiter(field: &'static str, value: &str) -> Result<(), KvpError> {
 ///
 /// Metadata (`agent`, `boot_epoch`, `vm_id`, `kind`, `name`, `event_id`)
 /// comes from the record key; the payload (`timestamp`, `result`,
-/// `duration`, `message`) comes from the value. Optional fields are
-/// populated only when the source provides them: azure-init events carry
-/// a `timestamp`; cloud-init `finish` records carry a `result` and
-/// `duration`. Write azure-init events with
-/// [`DiagnosticsKvp::emit_event`]; read events back via
-/// [`records`](DiagnosticsKvp::records) /
-/// [`events`](DiagnosticsKvp::events).
+/// `duration`, `message`) from the value. Optional fields are populated
+/// only when the source provides them (e.g. cloud-init `finish` records
+/// carry `result` and `duration`).
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[non_exhaustive]
 pub struct DiagnosticEvent {
@@ -415,7 +410,7 @@ pub enum DiagnosticRecord {
 /// A typed diagnostics view over a [`KvpPoolStore`].
 ///
 /// Owns the `agent` and `vm_id` stamped into this layer's azure-init
-/// event keys. See the [module documentation](self) for the on-disk
+/// event keys. See the module-level documentation for the on-disk
 /// format.
 #[derive(Clone, Debug)]
 pub struct DiagnosticsKvp {
@@ -469,12 +464,12 @@ impl DiagnosticsKvp {
     /// (stamping `boot_epoch`, `vm_id`, `agent`, and the current
     /// `timestamp`) and write `value` as its message.
     ///
-    /// Messages longer than [`MAX_CHUNK_BYTES`] are split
-    /// at UTF-8 codepoint boundaries and written as multiple records
-    /// atomically under a single lock via
-    /// [`KvpPoolStore::append_multiple`]. Each chunk is keyed with a
-    /// `|<subevent_index>` suffix so every record is unique, and the
-    /// chunks are regrouped by [`records`](Self::records) on read.
+    /// The message is written under a single lock via
+    /// [`KvpPoolStore::append_multiple`]; values longer than
+    /// [`MAX_CHUNK_BYTES`] are split at UTF-8 codepoint boundaries into
+    /// multiple records. Every record is keyed with a `|<subevent_index>`
+    /// suffix (`0`, `1`, …) so it is unique, and the chunks are regrouped
+    /// by [`records`](Self::records) on read.
     ///
     /// Returns [`KvpError::EventFieldContainsDelimiter`] if `agent`,
     /// `vm_id`, `name`, or `event_id` contains the `|` key delimiter.
@@ -505,30 +500,20 @@ impl DiagnosticsKvp {
         self.write_chunked(&key, value)
     }
 
-    /// Split `value` at [`MAX_CHUNK_BYTES`] and append the
-    /// chunks under `key` in one atomic batch.
-    ///
-    /// A single-record value keeps the bare event `key`. A value that
-    /// spans multiple records gets one record per chunk, each keyed
-    /// `<key>|<subevent_index>` (`0`, `1`, …) so no two records collide —
-    /// the Hyper-V host keeps only one record per key. [`reassemble`]
-    /// strips the subevent index to regroup the chunks on read.
+    /// Split `value` at [`MAX_CHUNK_BYTES`] and append each chunk in one
+    /// atomic batch, keyed `<key>|<subevent_index>` (`0`, `1`, …) so every
+    /// record is unique. [`reassemble`] strips the index on read.
     fn write_chunked(&self, key: &str, value: &str) -> Result<(), KvpError> {
-        let chunks = chunk_at_char_boundary(value, MAX_CHUNK_BYTES);
-        if chunks.len() == 1 {
-            return self
-                .store
-                .append_multiple(chunks.into_iter().map(|chunk| (key, chunk)));
-        }
-        let records: Vec<(String, &str)> = chunks
-            .into_iter()
-            .enumerate()
-            .map(|(subevent_index, chunk)| {
-                let chunk_key =
-                    format!("{key}{EVENT_KEY_DELIMITER}{subevent_index}");
-                (chunk_key, chunk)
-            })
-            .collect();
+        let records: Vec<(String, &str)> =
+            chunk_at_char_boundary(value, MAX_CHUNK_BYTES)
+                .into_iter()
+                .enumerate()
+                .map(|(subevent_index, chunk)| {
+                    let chunk_key =
+                        format!("{key}{EVENT_KEY_DELIMITER}{subevent_index}");
+                    (chunk_key, chunk)
+                })
+                .collect();
         self.store.append_multiple(records)
     }
 
@@ -583,32 +568,17 @@ impl DiagnosticsKvp {
     }
 }
 
-/// The event key a chunk belongs to.
-///
-/// [`DiagnosticsKvp::write_chunked`] gives each chunk of a multi-record
-/// event a unique key by appending a `|<subevent_index>` (cloud-init's
-/// term) to the event key, so the Hyper-V host — which keeps only one
-/// record per key — retains every chunk. This returns the shared event
-/// key used to regroup them on read: for a chunk key
-/// `<event-key>|<subevent_index>` it strips the trailing index; any other
-/// key (a single-record event, `PROVISIONING_REPORT`, a malformed key, …)
-/// is returned unchanged.
+/// The shared event key a chunk belongs to: strips a trailing
+/// `|<subevent_index>`, or returns the key unchanged if it has none.
 fn base_event_key(key: &str) -> &str {
     split_subevent_index(key).0
 }
 
 /// Split a key into its base event key and optional trailing subevent
-/// index. When the trailing segment is numeric and the base parses as an
-/// event key — a valid azure-init or cloud-init event, or a malformed one
-/// (event-shaped but invalid) — returns
-/// `(base, Some(index))`; any other key (a single-record event,
-/// `PROVISIONING_REPORT`, …) returns `(key, None)`.
-///
-/// The subevent index is the same trailing `|<i>` cloud-init and
-/// azure-init append to give each chunk a unique key; [`reassemble`] uses
-/// it both to regroup an event's chunks and to restore their write order.
-/// Malformed keys are included so a chunked malformed event still
-/// regroups and is cleared consistently with a single-record one.
+/// index: `(base, Some(index))` when a trailing numeric segment follows an
+/// event-shaped base (valid or malformed), else `(key, None)`.
+/// [`reassemble`] uses the index to regroup an event's chunks and restore
+/// their write order.
 fn split_subevent_index(key: &str) -> (&str, Option<u32>) {
     if let Some((base, index)) = key.rsplit_once(EVENT_KEY_DELIMITER) {
         if let Ok(index) = index.parse::<u32>() {
@@ -656,15 +626,10 @@ fn reassemble(dumped: Vec<(String, String)>) -> Vec<DiagnosticRecord> {
     records
 }
 
-/// Turn one reassembled group of chunk values into a
-/// [`DiagnosticRecord`].
-///
-/// `chunk_values` holds every record that shared the base event key,
-/// already ordered by subevent index by [`reassemble`], and is never
-/// empty. azure-init events and raw records concatenate their values
-/// directly. cloud-init writes each chunk as a metadata object carrying a
-/// slice of the escaped message, so those are stitched back together and
-/// decoded (see [`decode_cloud_init_value`]).
+/// Classify one reassembled group of chunk values (ordered by subevent
+/// index, never empty) into a [`DiagnosticRecord`]. azure-init and raw
+/// records concatenate their values; cloud-init chunks are stitched and
+/// decoded via [`decode_cloud_init_value`].
 fn classify_record(key: String, chunk_values: Vec<String>) -> DiagnosticRecord {
     let chunks = chunk_values.len();
     match classify_key(&key) {
@@ -751,20 +716,14 @@ fn classify_record(key: String, chunk_values: Vec<String>) -> DiagnosticRecord {
 /// Marker preceding a cloud-init value's message field: `"msg":"`.
 const CLOUD_INIT_MSG_MARKER: &str = "\"msg\":\"";
 
-/// Decode a cloud-init event's chunk value(s) into its reassembled
-/// `message` and the JSON object carrying its `ts`/`result`/`duration`
-/// metadata, read from an untyped [`serde_json::Value`] so no serde
-/// deserialization target is needed. [`classify_record`] maps those
-/// fields onto the shared [`DiagnosticEvent`].
+/// Decode a cloud-init event's chunk value(s) into `(metadata, message)`,
+/// reading `ts`/`result`/`duration` from an untyped [`serde_json::Value`].
 ///
-/// A single-record event is a complete JSON object, parsed directly. A
-/// multi-record event was split by cloud-init's `_break_down`, which
-/// slices the JSON-*escaped* message at character boundaries — so an
-/// individual chunk can end mid-escape (e.g. a `\n` split into `\` and
-/// `n`) and is not valid JSON on its own. We therefore recover the raw
-/// (still-escaped) `msg` slice from each chunk, concatenate the slices in
-/// order, and unescape the whole once; the metadata is read from the
-/// first chunk's non-`msg` fields.
+/// A single record is complete JSON, parsed directly. A multi-record event
+/// was split mid-escape by cloud-init's `_break_down` (e.g. a `\n` cut into
+/// `\` and `n`), so no chunk is valid JSON alone: recover each chunk's raw
+/// escaped `msg` slice, concatenate, and unescape once; metadata comes from
+/// the first chunk.
 fn decode_cloud_init_value(
     chunks: &[String],
 ) -> Result<(serde_json::Value, String), String> {

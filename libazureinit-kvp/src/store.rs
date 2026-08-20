@@ -133,7 +133,7 @@ impl KvpPoolStore {
     /// checking for an existing key.
     ///
     /// This preserves any existing records, including duplicate keys,
-    /// and does not enforce [`MAX_UNIQUE_KEYS`]. Use
+    /// and does not enforce the `MAX_UNIQUE_KEYS` cap. Use
     /// [`insert`](Self::insert) when callers need upsert semantics.
     pub fn append(&self, key: &str, value: &str) -> Result<(), KvpError> {
         validate_key(key, self.mode.max_key_size())?;
@@ -153,8 +153,8 @@ impl KvpPoolStore {
     /// interleaving with the batch.
     ///
     /// Existing records are kept and duplicate keys are preserved.
-    /// Like [`append`](Self::append), this does not enforce
-    /// [`MAX_UNIQUE_KEYS`]; use [`load`](Self::load) when the
+    /// Like [`append`](Self::append), this does not enforce the
+    /// `MAX_UNIQUE_KEYS` cap; use [`load`](Self::load) when the
     /// caller is replacing the entire pool and wants the unique-key cap
     /// enforced. Validation happens before the file is opened; empty
     /// input is a no-op and does not create the pool file. If an I/O
@@ -547,7 +547,7 @@ impl KvpPoolStore {
     ///
     /// This is the inverse of [`dump`](Self::dump): duplicate keys are
     /// preserved exactly as provided, but the number of unique keys is
-    /// capped at [`MAX_UNIQUE_KEYS`]. Existing records are discarded;
+    /// capped at `MAX_UNIQUE_KEYS`. Existing records are discarded;
     /// empty input clears the pool. Use
     /// [`append_multiple`](Self::append_multiple) when callers need to
     /// extend the pool instead.

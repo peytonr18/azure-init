@@ -739,26 +739,15 @@ fn resolve_vm_id_with(
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SupportingData(Vec<(String, String)>);
 
-/// Parse a `--supporting-data` argument into its `key=value` pairs.
+/// Parse a `--supporting-data` argument into its comma-separated
+/// `key=value` pairs. A value wrapped in matching single/double quotes may
+/// contain literal commas (the quotes must wrap the whole value and are
+/// stripped); empty fields are ignored.
 ///
-/// Fields are comma-separated. A value may be wrapped in matching single or
-/// double quotes so it can contain literal commas; the quotes are honored
-/// only when they wrap the *entire* value (the opening quote immediately
-/// follows `=` and the matching quote ends the field) and are stripped from
-/// the stored value. Empty fields (such as a trailing comma) are ignored.
-///
-/// Supported (input -> parsed pairs):
-/// - `k=v` -> `k`=`v`
-/// - `k1=v1,k2=v2` -> `k1`=`v1`, `k2`=`v2`
-/// - `k='a,b'` or `k="a,b"` -> `k`=`a,b` (quotes protect the comma)
-/// - `k=a'b` -> `k`=`a'b` (a quote not at the value start is literal)
-/// - `k=v,` -> `k`=`v` (trailing/empty field ignored)
-///
-/// Rejected:
-/// - `novalue` -> missing `=`
-/// - `=v` -> empty key
-/// - `k='a,b` -> unterminated quote
-/// - `k='a,b'x` -> characters after a quoted value
+/// Supported: `k=v`; `k1=v1,k2=v2`; `k='a,b'` or `k="a,b"` -> `k`=`a,b`;
+/// `k=a'b` -> literal quote; `k=v,` -> trailing field ignored.
+/// Rejected: `novalue` (no `=`), `=v` (empty key), `k='a,b`
+/// (unterminated quote), `k='a,b'x` (chars after a quoted value).
 fn parse_supporting_data(raw: &str) -> Result<SupportingData, String> {
     let mut pairs = Vec::new();
     for field in split_supporting_data_fields(raw)? {
