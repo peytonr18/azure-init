@@ -89,20 +89,21 @@ pub const MAX_CHUNK_BYTES: usize = 1022;
 /// Delimiter separating the segments of a diagnostic event key.
 const EVENT_KEY_DELIMITER: char = '|';
 
-/// The kind of a diagnostic record: a span boundary (`start`/`finish`)
-/// or a point `event`. The `start`/`finish` tokens match cloud-init's,
-/// so a span's boundaries read the same whichever agent emitted them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
+/// The kind of a diagnostic record. `start`/`finish`/`event` are shared
+/// with azure-init; cloud-init's other reporting types (`diagnostic`,
+/// `compressed`, `boot-telemetry`, …) are kept verbatim as
+/// [`Other`](RecordKind::Other).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecordKind {
-    /// The opening of a span (a function or stage begins), written
-    /// `start`.
+    /// A span opening, written `start`.
     Start,
-    /// The closing of a span (a function or stage ends), written
-    /// `finish`.
+    /// A span closing, written `finish`.
     Finish,
     /// A point-in-time event, written `event`.
     Event,
+    /// Any other reporting type, kept verbatim (cloud-init only;
+    /// azure-init never writes it).
+    Other(String),
 }
 
 impl std::fmt::Display for RecordKind {
@@ -111,12 +112,24 @@ impl std::fmt::Display for RecordKind {
             Self::Start => "start",
             Self::Finish => "finish",
             Self::Event => "event",
+            Self::Other(token) => token.as_str(),
         })
     }
 }
 
-/// Parses the on-disk `kind`/`type` token; cloud-init emits only
-/// `start`/`finish`.
+/// Serializes as the on-disk token (the `Display` form).
+impl serde::Serialize for RecordKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+/// Parses an azure-init `kind` token — strictly `start`/`finish`/`event`
+/// (a corrupt azure-init kind is rejected). cloud-init's wider `type`
+/// space is mapped separately and falls back to [`RecordKind::Other`].
 impl std::str::FromStr for RecordKind {
     type Err = ();
 
@@ -240,12 +253,12 @@ fn classify_key(key: &str) -> KeyClass<'_> {
 
 /// Classify a `CLOUD_INIT`-prefixed key into a [`KeyClass::CloudInit`].
 ///
-/// Handles both the current layout
+/// Handles the current layout
 /// (`CLOUD_INIT|<incarnation>|<type>|<name>|<vm_id>|<uuid>`) and the
-/// older one that predates the `vm_id` segment
-/// (`CLOUD_INIT|<incarnation>|<type>|<name>|<uuid>`). Any other segment
-/// count is [`KeyClass::Raw`]; a right-shaped key with a non-numeric
-/// incarnation or unrecognized type is [`KeyClass::Malformed`].
+/// older one without the `vm_id` segment. A wrong segment count is
+/// [`KeyClass::Raw`]; a non-numeric incarnation is
+/// [`KeyClass::Malformed`]. Any `type` other than `start`/`finish`/`event`
+/// is preserved as [`RecordKind::Other`], not rejected.
 fn classify_cloud_init_key(key: &str) -> KeyClass<'_> {
     let mut segments = key.split(EVENT_KEY_DELIMITER);
     let _prefix = segments.next();
@@ -269,11 +282,10 @@ fn classify_cloud_init_key(key: &str) -> KeyClass<'_> {
             ),
         };
     };
-    let Ok(kind) = event_type.parse::<RecordKind>() else {
-        return KeyClass::Malformed {
-            reason: format!("unrecognized cloud-init type {event_type:?}"),
-        };
-    };
+    // Non-span cloud-init types are kept verbatim, not rejected.
+    let kind = event_type
+        .parse::<RecordKind>()
+        .unwrap_or_else(|()| RecordKind::Other(event_type.to_string()));
     KeyClass::CloudInit {
         boot_epoch,
         kind,
@@ -834,7 +846,7 @@ mod tests {
                 AGENT,
                 BOOT_EPOCH,
                 VM_ID,
-                expected,
+                expected.clone(),
                 "span:event",
                 EVENT_ID,
                 TIMESTAMP,
@@ -844,6 +856,22 @@ mod tests {
                 KeyClass::Event { kind, .. } if kind == expected
             ));
         }
+    }
+
+    #[rstest]
+    #[case::start(RecordKind::Start, "start")]
+    #[case::finish(RecordKind::Finish, "finish")]
+    #[case::event(RecordKind::Event, "event")]
+    #[case::other(RecordKind::Other("compressed".to_string()), "compressed")]
+    fn record_kind_renders_as_its_token(
+        #[case] kind: RecordKind,
+        #[case] token: &str,
+    ) {
+        assert_eq!(kind.to_string(), token);
+        assert_eq!(
+            serde_json::to_value(&kind).unwrap(),
+            serde_json::json!(token)
+        );
     }
 
     fn class_of(key: &str) -> &'static str {
@@ -867,9 +895,9 @@ mod tests {
     #[case::raw_non_numeric_boot_epoch("a|notnum|vm|event|name|id|ts", "raw")]
     #[case::malformed_bad_kind("a|100|vm|NOTAKIND|name|id|ts", "malformed")]
     #[case::malformed_other_kind("a|100|vm|nope|name|id|ts", "malformed")]
-    #[case::cloud_init_bad_type(
-        "CLOUD_INIT|100|weird|name|vmid|uuid",
-        "malformed"
+    #[case::cloud_init_custom_type(
+        "CLOUD_INIT|100|compressed|name|vmid|uuid",
+        "cloud-init"
     )]
     #[case::cloud_init_non_numeric_incarnation(
         "CLOUD_INIT|notnum|finish|name|vmid|uuid",
@@ -1241,6 +1269,22 @@ mod tests {
                 chunks: 1,
             }
         );
+    }
+
+    #[test]
+    fn cloud_init_non_span_type_decodes_to_other_kind() {
+        let key = format!(
+            "CLOUD_INIT|1785187982|compressed|cloud-init.log|\
+             {CLOUD_INIT_VM_ID}|abc12345-1111-2222-3333-444455556666"
+        );
+        let value = r#"{"name":"cloud-init.log","type":"compressed","ts":"2026-07-27T21:33:24.339006+00:00","msg":"payload"}"#;
+        assert!(matches!(
+            classify_record(key, vec![value.to_string()]),
+            DiagnosticRecord::Decoded { event, chunks: 1 }
+            if event.kind == RecordKind::Other("compressed".to_string())
+                && event.agent == "CLOUD_INIT"
+                && event.message == "payload"
+        ));
     }
 
     #[test]
