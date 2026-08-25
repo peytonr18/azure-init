@@ -32,6 +32,9 @@
 //!
 //! This module is policy only: all locking, size enforcement, and
 //! on-disk encoding stay in [`KvpPoolStore`](crate::KvpPoolStore).
+//! Writing is azure-init only; reading dispatches over one `KeyFormat`
+//! decoder per layout — see the `azure_init` (native, read + write) and
+//! `cloud_init` (read-only) submodules.
 //!
 //! # Example
 //!
@@ -65,6 +68,9 @@
 //! # Ok(())
 //! # }
 //! ```
+
+mod azure_init;
+mod cloud_init;
 
 use chrono::Utc;
 use uuid::Uuid;
@@ -148,151 +154,39 @@ fn now_timestamp() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
-/// Format an azure-init diagnostic event's *shared* key as its
-/// `|`-delimited on-disk string:
-/// `<agent>|<boot_epoch>|<vm_id>|<kind>|<name>|<event_id>|<timestamp>`.
+/// A recognized on-pool key format that decodes into the canonical
+/// [`DiagnosticEvent`].
 ///
-/// `boot_epoch` is the Unix epoch second the system booted (see
-/// [`KvpPoolStore::boot_epoch`](crate::KvpPoolStore::boot_epoch)); it sits
-/// in the same slot as cloud-init's incarnation. `kind` records the
-/// span/event shape. [`classify_key`] is the inverse. For example:
-///
-/// ```text
-/// azure-init-0.1.0|1785187982|3f2504e0-...|event|user:create_user|8f3e9c4a-...|2026-07-27T21:33:24.300Z
-/// ```
-fn format_event_key(
-    agent: &str,
-    boot_epoch: i64,
-    vm_id: &str,
-    kind: RecordKind,
-    name: &str,
-    event_id: &str,
-    timestamp: &str,
-) -> String {
-    let d = EVENT_KEY_DELIMITER;
-    format!(
-        "{agent}{d}{boot_epoch}{d}{vm_id}{d}{kind}{d}{name}{d}{event_id}\
-         {d}{timestamp}"
-    )
-}
-enum KeyClass<'a> {
-    Event {
-        agent: &'a str,
-        boot_epoch: i64,
-        vm_id: &'a str,
-        kind: RecordKind,
-        name: &'a str,
-        event_id: &'a str,
-        timestamp: &'a str,
-    },
-    /// The key is a well-formed cloud-init reporting event key
-    /// (`CLOUD_INIT|<incarnation>|<type>|<name>|[<vm_id>|]<uuid>`).
-    CloudInit {
-        boot_epoch: i64,
-        kind: RecordKind,
-        name: &'a str,
-        vm_id: Option<&'a str>,
-        uuid: &'a str,
-    },
-    Malformed {
-        reason: String,
-    },
-    Raw,
+/// azure-init is the native format and the only one this crate writes (see
+/// the `azure_init` submodule); others such as `cloud_init` are read-only.
+/// Reading dispatches over [`FORMATS`]: the first format that
+/// [`owns`](KeyFormat::owns) a key decodes it, so azure-init is one decoder
+/// among peers rather than an implicit default.
+trait KeyFormat {
+    /// Whether `base_key` has this format's shape. Used both to group an
+    /// event's chunks and to select a decoder; content validity (a bad
+    /// kind, a non-numeric incarnation, invalid JSON) is reported by
+    /// [`decode`](KeyFormat::decode).
+    fn owns(&self, base_key: &str) -> bool;
+
+    /// Decode a recognized `base_key` and its ordered `chunks` into the
+    /// canonical event, or return why the record is malformed.
+    fn decode(
+        &self,
+        base_key: &str,
+        chunks: &[String],
+    ) -> Result<DiagnosticEvent, String>;
 }
 
-/// Classify a raw pool key.
-fn classify_key(key: &str) -> KeyClass<'_> {
-    if key.split(EVENT_KEY_DELIMITER).next() == Some(CLOUD_INIT_PREFIX) {
-        return classify_cloud_init_key(key);
-    }
+/// Every known key format, tried in order. cloud-init is checked before
+/// azure-init so a `CLOUD_INIT`-prefixed key never reaches the native
+/// parser; adding a format is a new submodule plus one entry here.
+const FORMATS: &[&dyn KeyFormat] =
+    &[&cloud_init::CloudInit, &azure_init::AzureInit];
 
-    let mut segments = key.split(EVENT_KEY_DELIMITER);
-    let (
-        Some(agent),
-        Some(boot_epoch),
-        Some(vm_id),
-        Some(kind),
-        Some(name),
-        Some(event_id),
-        Some(timestamp),
-    ) = (
-        segments.next(),
-        segments.next(),
-        segments.next(),
-        segments.next(),
-        segments.next(),
-        segments.next(),
-        segments.next(),
-    )
-    else {
-        return KeyClass::Raw;
-    };
-    if segments.next().is_some() {
-        return KeyClass::Raw;
-    }
-
-    let Ok(boot_epoch) = boot_epoch.parse::<i64>() else {
-        return KeyClass::Raw;
-    };
-
-    match kind.parse::<RecordKind>() {
-        Ok(kind) => KeyClass::Event {
-            agent,
-            boot_epoch,
-            vm_id,
-            kind,
-            name,
-            event_id,
-            timestamp,
-        },
-        Err(()) => KeyClass::Malformed {
-            reason: format!("unrecognized kind {kind:?}"),
-        },
-    }
-}
-
-/// Classify a `CLOUD_INIT`-prefixed key into a [`KeyClass::CloudInit`].
-///
-/// Handles the current layout
-/// (`CLOUD_INIT|<incarnation>|<type>|<name>|<vm_id>|<uuid>`) and the
-/// older one without the `vm_id` segment. A wrong segment count is
-/// [`KeyClass::Raw`]; a non-numeric incarnation is
-/// [`KeyClass::Malformed`]. Any `type` other than `start`/`finish`/`event`
-/// is preserved as [`RecordKind::Other`], not rejected.
-fn classify_cloud_init_key(key: &str) -> KeyClass<'_> {
-    let mut segments = key.split(EVENT_KEY_DELIMITER);
-    let _prefix = segments.next();
-    let (Some(incarnation), Some(event_type), Some(name), Some(fourth)) = (
-        segments.next(),
-        segments.next(),
-        segments.next(),
-        segments.next(),
-    ) else {
-        return KeyClass::Raw;
-    };
-    let (vm_id, uuid) = match (segments.next(), segments.next()) {
-        (None, None) => (None, fourth),
-        (Some(uuid), None) => (Some(fourth), uuid),
-        _ => return KeyClass::Raw,
-    };
-    let Ok(boot_epoch) = incarnation.parse::<i64>() else {
-        return KeyClass::Malformed {
-            reason: format!(
-                "non-numeric cloud-init incarnation {incarnation:?}"
-            ),
-        };
-    };
-    // Non-span cloud-init types are kept verbatim, not rejected.
-    let kind = event_type
-        .parse::<RecordKind>()
-        .unwrap_or_else(|()| RecordKind::Other(event_type.to_string()));
-    KeyClass::CloudInit {
-        boot_epoch,
-        kind,
-        name,
-        vm_id,
-        uuid,
-    }
+/// The format that owns `key`, if any.
+fn format_for(key: &str) -> Option<&'static dyn KeyFormat> {
+    FORMATS.iter().copied().find(|format| format.owns(key))
 }
 
 /// Split `value` into pieces of at most `max_bytes` bytes each, always
@@ -334,7 +228,7 @@ fn chunk_at_char_boundary(value: &str, max_bytes: usize) -> Vec<&str> {
 }
 
 /// Reject the `|` key delimiter in an event field so the formatted key
-/// round-trips through [`classify_key`].
+/// round-trips through its [`KeyFormat`] decoder.
 fn reject_delimiter(field: &'static str, value: &str) -> Result<(), KvpError> {
     if value.contains(EVENT_KEY_DELIMITER) {
         return Err(KvpError::EventFieldContainsDelimiter { field });
@@ -499,7 +393,7 @@ impl DiagnosticsKvp {
 
         let boot_epoch = self.store.boot_epoch()?;
         let timestamp = now_timestamp();
-        let key = format_event_key(
+        let key = azure_init::format_event_key(
             &self.agent,
             boot_epoch,
             &self.vm_id,
@@ -568,10 +462,8 @@ impl DiagnosticsKvp {
             .dump()?
             .into_iter()
             .filter_map(|(key, _)| {
-                let is_diagnostic = !matches!(
-                    classify_key(base_event_key(&key)),
-                    KeyClass::Raw
-                );
+                let is_diagnostic =
+                    format_for(base_event_key(&key)).is_some();
                 is_diagnostic.then_some(key)
             })
             .collect();
@@ -594,12 +486,7 @@ fn base_event_key(key: &str) -> &str {
 fn split_subevent_index(key: &str) -> (&str, Option<u32>) {
     if let Some((base, index)) = key.rsplit_once(EVENT_KEY_DELIMITER) {
         if let Ok(index) = index.parse::<u32>() {
-            if matches!(
-                classify_key(base),
-                KeyClass::Event { .. }
-                    | KeyClass::CloudInit { .. }
-                    | KeyClass::Malformed { .. }
-            ) {
+            if format_for(base).is_some() {
                 return (base, Some(index));
             }
         }
@@ -638,157 +525,31 @@ fn reassemble(dumped: Vec<(String, String)>) -> Vec<DiagnosticRecord> {
     records
 }
 
-/// Classify one reassembled group of chunk values (ordered by subevent
-/// index, never empty) into a [`DiagnosticRecord`]. azure-init and raw
-/// records concatenate their values; cloud-init chunks are stitched and
-/// decoded via [`decode_cloud_init_value`].
+/// Classify one reassembled group of chunk values (never empty) into a
+/// [`DiagnosticRecord`] by dispatching over [`FORMATS`]: the owning format
+/// decodes the group, an unrecognized key is [`Raw`](DiagnosticRecord::Raw),
+/// and a decode failure is [`Malformed`](DiagnosticRecord::Malformed).
 fn classify_record(key: String, chunk_values: Vec<String>) -> DiagnosticRecord {
     let chunks = chunk_values.len();
-    match classify_key(&key) {
-        KeyClass::Event {
-            agent,
-            boot_epoch,
-            vm_id,
-            kind,
-            name,
-            event_id,
-            timestamp,
-        } => {
-            let message = chunk_values.concat();
-            DiagnosticRecord::Decoded {
-                event: DiagnosticEvent {
-                    agent: agent.to_string(),
-                    boot_epoch,
-                    vm_id: Some(vm_id.to_string()),
-                    kind,
-                    name: name.to_string(),
-                    event_id: event_id.to_string(),
-                    timestamp: Some(timestamp.to_string()),
-                    result: None,
-                    duration: None,
-                    message,
-                },
-                chunks,
-            }
-        }
-        KeyClass::CloudInit {
-            boot_epoch,
-            kind,
-            name,
-            vm_id,
-            uuid,
-        } => {
-            // Own the key-derived fields up front so `key` and
-            // `chunk_values` can move into a `Malformed` record when a
-            // chunk's value fails to decode.
-            let name = name.to_string();
-            let vm_id = vm_id.map(str::to_string);
-            let uuid = uuid.to_string();
-            match decode_cloud_init_value(&chunk_values) {
-                Ok((meta, message)) => DiagnosticRecord::Decoded {
-                    event: DiagnosticEvent {
-                        agent: CLOUD_INIT_PREFIX.to_string(),
-                        boot_epoch,
-                        vm_id,
-                        kind,
-                        name,
-                        event_id: uuid,
-                        timestamp: meta
-                            .get("ts")
-                            .and_then(|t| t.as_str())
-                            .map(str::to_string),
-                        result: meta
-                            .get("result")
-                            .and_then(|r| r.as_str())
-                            .map(str::to_string),
-                        duration: meta.get("duration").and_then(|d| d.as_f64()),
-                        message,
-                    },
-                    chunks,
-                },
-                Err(err) => DiagnosticRecord::Malformed {
-                    key,
-                    value: chunk_values.concat(),
-                    reason: format!("invalid cloud-init JSON value: {err}"),
-                },
-            }
-        }
-        KeyClass::Malformed { reason } => DiagnosticRecord::Malformed {
-            key,
-            value: chunk_values.concat(),
-            reason,
+    match format_for(&key) {
+        Some(format) => match format.decode(&key, &chunk_values) {
+            Ok(event) => DiagnosticRecord::Decoded { event, chunks },
+            Err(reason) => DiagnosticRecord::Malformed {
+                key,
+                value: chunk_values.concat(),
+                reason,
+            },
         },
-        KeyClass::Raw => DiagnosticRecord::Raw {
+        None => DiagnosticRecord::Raw {
             key,
             value: chunk_values.concat(),
         },
     }
-}
-
-/// Marker preceding a cloud-init value's message field: `"msg":"`.
-const CLOUD_INIT_MSG_MARKER: &str = "\"msg\":\"";
-
-/// Decode a cloud-init event's chunk value(s) into `(metadata, message)`,
-/// reading `ts`/`result`/`duration` from an untyped [`serde_json::Value`].
-///
-/// A single record is complete JSON, parsed directly. A multi-record event
-/// was split mid-escape by cloud-init's `_break_down` (e.g. a `\n` cut into
-/// `\` and `n`), so no chunk is valid JSON alone: recover each chunk's raw
-/// escaped `msg` slice, concatenate, and unescape once; metadata comes from
-/// the first chunk.
-fn decode_cloud_init_value(
-    chunks: &[String],
-) -> Result<(serde_json::Value, String), String> {
-    if let [only] = chunks {
-        let value: serde_json::Value =
-            serde_json::from_str(only).map_err(|e| e.to_string())?;
-        let message = value
-            .get("msg")
-            .and_then(|m| m.as_str())
-            .unwrap_or_default()
-            .to_string();
-        return Ok((value, message));
-    }
-
-    let mut escaped = String::new();
-    for chunk in chunks {
-        escaped.push_str(cloud_init_escaped_msg_slice(chunk)?);
-    }
-    let message: String = serde_json::from_str(&format!("\"{escaped}\""))
-        .map_err(|e| e.to_string())?;
-
-    Ok((cloud_init_chunk_metadata(&chunks[0])?, message))
-}
-
-/// Recover a chunk's raw (still-escaped) `msg` slice — the bytes between
-/// the `"msg":"` marker and the closing `"}` — without unescaping.
-fn cloud_init_escaped_msg_slice(chunk: &str) -> Result<&str, String> {
-    let start = chunk
-        .find(CLOUD_INIT_MSG_MARKER)
-        .ok_or("chunk is missing a \"msg\" field")?
-        + CLOUD_INIT_MSG_MARKER.len();
-    let end = chunk
-        .strip_suffix("\"}")
-        .map(str::len)
-        .ok_or("chunk does not end with '\"}'")?;
-    chunk
-        .get(start..end)
-        .ok_or_else(|| "chunk \"msg\" field is malformed".to_string())
-}
-
-/// Parse a chunk's non-`msg` prefix (the portion before its `,"msg":"`
-/// field, which is always valid JSON) into a [`serde_json::Value`].
-fn cloud_init_chunk_metadata(chunk: &str) -> Result<serde_json::Value, String> {
-    let marker = format!(",{CLOUD_INIT_MSG_MARKER}");
-    let end = chunk
-        .find(&marker)
-        .ok_or("chunk is missing a \"msg\" field")?;
-    serde_json::from_str(&format!("{}}}", &chunk[..end]))
-        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
 mod tests {
+    use super::azure_init::format_event_key;
     use super::*;
     use crate::{KvpPool, PoolMode};
     use rstest::rstest;
@@ -818,22 +579,15 @@ mod tests {
             )
         );
         assert!(matches!(
-            classify_key(&formatted),
-            KeyClass::Event {
-                agent,
-                boot_epoch,
-                vm_id,
-                kind,
-                name,
-                event_id,
-                timestamp,
-            } if agent == AGENT
-                && boot_epoch == BOOT_EPOCH
-                && vm_id == VM_ID
-                && kind == RecordKind::Event
-                && name == "user:create_user"
-                && event_id == EVENT_ID
-                && timestamp == TIMESTAMP
+            classify_record(formatted, vec!["msg".to_string()]),
+            DiagnosticRecord::Decoded { event, chunks: 1 }
+            if event.agent == AGENT
+                && event.boot_epoch == BOOT_EPOCH
+                && event.vm_id.as_deref() == Some(VM_ID)
+                && event.kind == RecordKind::Event
+                && event.name == "user:create_user"
+                && event.event_id == EVENT_ID
+                && event.timestamp.as_deref() == Some(TIMESTAMP)
         ));
     }
 
@@ -852,8 +606,9 @@ mod tests {
                 TIMESTAMP,
             );
             assert!(matches!(
-                classify_key(&key),
-                KeyClass::Event { kind, .. } if kind == expected
+                classify_record(key, vec!["m".to_string()]),
+                DiagnosticRecord::Decoded { event, .. }
+                if event.kind == expected
             ));
         }
     }
@@ -875,11 +630,18 @@ mod tests {
     }
 
     fn class_of(key: &str) -> &'static str {
-        match classify_key(key) {
-            KeyClass::Event { .. } => "event",
-            KeyClass::CloudInit { .. } => "cloud-init",
-            KeyClass::Malformed { .. } => "malformed",
-            KeyClass::Raw => "raw",
+        // A valid cloud-init value so only KEY-level problems drive the
+        // result, matching the former key-only classifier.
+        let value = r#"{"msg":"x"}"#.to_string();
+        match classify_record(key.to_string(), vec![value]) {
+            DiagnosticRecord::Decoded { event, .. }
+                if event.agent == "CLOUD_INIT" =>
+            {
+                "cloud-init"
+            }
+            DiagnosticRecord::Decoded { .. } => "event",
+            DiagnosticRecord::Malformed { .. } => "malformed",
+            DiagnosticRecord::Raw { .. } => "raw",
         }
     }
 
@@ -1183,25 +945,30 @@ mod tests {
     #[test]
     fn cloud_init_key_classifies() {
         assert!(matches!(
-            classify_key(CLOUD_INIT_KEY_FINISH),
-            KeyClass::CloudInit { boot_epoch, kind, name, vm_id, uuid }
-            if boot_epoch == 1785187982
-                && kind == RecordKind::Finish
-                && name == "modules-final/config-scripts_user"
-                && vm_id == Some(CLOUD_INIT_VM_ID)
-                && uuid == "e5f01809-a7a3-4279-aa64-1f18e21eda6e"
+            classify_record(
+                CLOUD_INIT_KEY_FINISH.to_string(),
+                vec![CLOUD_INIT_VALUE_FINISH.to_string()],
+            ),
+            DiagnosticRecord::Decoded { event, .. }
+            if event.boot_epoch == 1785187982
+                && event.kind == RecordKind::Finish
+                && event.name == "modules-final/config-scripts_user"
+                && event.vm_id.as_deref() == Some(CLOUD_INIT_VM_ID)
+                && event.event_id == "e5f01809-a7a3-4279-aa64-1f18e21eda6e"
         ));
         assert!(matches!(
-            classify_key(
+            classify_record(
                 "CLOUD_INIT|1785187982|start|modules-config/foo|\
                  c4d4a08d-fe93-4c7a-9be6-9a38c212e212"
+                    .to_string(),
+                vec![r#"{"type":"start","msg":"x"}"#.to_string()],
             ),
-            KeyClass::CloudInit { boot_epoch, kind, name, vm_id, uuid }
-            if boot_epoch == 1785187982
-                && kind == RecordKind::Start
-                && name == "modules-config/foo"
-                && vm_id.is_none()
-                && uuid == "c4d4a08d-fe93-4c7a-9be6-9a38c212e212"
+            DiagnosticRecord::Decoded { event, .. }
+            if event.boot_epoch == 1785187982
+                && event.kind == RecordKind::Start
+                && event.name == "modules-config/foo"
+                && event.vm_id.is_none()
+                && event.event_id == "c4d4a08d-fe93-4c7a-9be6-9a38c212e212"
         ));
     }
 
