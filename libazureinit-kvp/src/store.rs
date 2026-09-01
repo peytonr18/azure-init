@@ -662,13 +662,19 @@ fn decode_record(data: &[u8]) -> io::Result<(String, String)> {
 
     let (key_bytes, value_bytes) = data.split_at(WIRE_MAX_KEY_BYTES);
 
-    let key = std::str::from_utf8(key_bytes)
+    let key_end = key_bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(key_bytes.len());
+    let key = std::str::from_utf8(&key_bytes[..key_end])
         .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?
-        .trim_end_matches('\0')
         .to_string();
-    let value = std::str::from_utf8(value_bytes)
+    let value_end = value_bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(value_bytes.len());
+    let value = std::str::from_utf8(&value_bytes[..value_end])
         .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?
-        .trim_end_matches('\0')
         .to_string();
 
     Ok((key, value))
@@ -2143,6 +2149,25 @@ mod tests {
         let (k, v) = decode_record(&record).unwrap();
         assert_eq!(k, key);
         assert_eq!(v, "val");
+    }
+
+    #[rstest]
+    #[case::key(Field::Key)]
+    #[case::value(Field::Value)]
+    fn test_decode_ignores_bytes_after_null_terminator(#[case] field: Field) {
+        let mut record = encode_record("key", "value");
+        let tail = match field {
+            Field::Key => &mut record[4..WIRE_MAX_KEY_BYTES],
+            Field::Value => {
+                &mut record[WIRE_MAX_KEY_BYTES + 6
+                    ..WIRE_MAX_KEY_BYTES + WIRE_MAX_VALUE_BYTES]
+            }
+        };
+        tail[..4].copy_from_slice(&[b'x', b'y', 0xFF, 0xFE]);
+
+        let (key, value) = decode_record(&record).unwrap();
+        assert_eq!(key, "key");
+        assert_eq!(value, "value");
     }
 
     /// Malformed buffers fed to `decode_record` produce the expected
