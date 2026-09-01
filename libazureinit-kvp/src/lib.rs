@@ -9,8 +9,8 @@
 //! - [`ProvisioningReport`]: structured provisioning health report that
 //!   is persisted as the single `PROVISIONING_REPORT` record with
 //!   [`write_report`].
-//! - [`DiagnosticsKvp`]: typed view over [`KvpPoolStore`] that formats,
-//!   chunks, and reassembles azure-init diagnostic events.
+//! - [`DiagnosticsKvp`]: typed writer for azure-init diagnostics and normalized
+//!   reader for azure-init and cloud-init entries.
 
 mod cli;
 mod diagnostics;
@@ -21,8 +21,7 @@ mod vm_id;
 
 pub use cli::run;
 pub use diagnostics::{
-    DiagnosticEvent, DiagnosticRecord, DiagnosticsKvp, RecordKind,
-    MAX_CHUNK_BYTES,
+    DiagnosticEvent, DiagnosticKind, DiagnosticsKvp, MAX_CHUNK_BYTES,
 };
 pub use error::KvpError;
 pub use report::{

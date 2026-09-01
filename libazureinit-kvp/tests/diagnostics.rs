@@ -2,15 +2,15 @@
 // Licensed under the MIT License.
 
 //! Integration tests for the [`DiagnosticsKvp`] layer: emit/read
-//! round-trips, chunk reassembly, classification, scoped clearing, and
-//! the concurrent-write atomicity guarantee that keeps chunked events
-//! from interleaving.
+//! round-trips, cloud-init normalization, chunk reassembly, and concurrent
+//! writes.
 
 use std::thread;
 
+use chrono::{DateTime, Utc};
 use libazureinit_kvp::{
-    DiagnosticEvent, DiagnosticRecord, DiagnosticsKvp, KvpPool, KvpPoolStore,
-    PoolMode, RecordKind, MAX_CHUNK_BYTES,
+    DiagnosticEvent, DiagnosticKind, DiagnosticsKvp, KvpPool, KvpPoolStore,
+    PoolMode, MAX_CHUNK_BYTES,
 };
 use rstest::rstest;
 use tempfile::TempDir;
@@ -22,7 +22,7 @@ fn diagnostics(dir: &TempDir) -> DiagnosticsKvp {
     let store =
         KvpPoolStore::new_in(KvpPool::Guest, dir.path(), PoolMode::Safe)
             .unwrap();
-    DiagnosticsKvp::new(store, VM_ID, PREFIX)
+    DiagnosticsKvp::new(store, VM_ID, PREFIX).unwrap()
 }
 
 /// Real cloud-init reporting entries captured from a guest pool 1 file.
@@ -52,41 +52,27 @@ fn reads_and_parses_real_cloud_init_pool() {
         store.append(key, value).unwrap();
     }
 
-    let diagnostics = DiagnosticsKvp::new(store, "", "");
-    let records = diagnostics.records().unwrap();
-    assert_eq!(records.len(), CLOUD_INIT_RECORDS.len());
+    let diagnostics = DiagnosticsKvp::new(store, "", "").unwrap();
+    let entries = diagnostics.entries().unwrap();
+    assert_eq!(entries.len(), CLOUD_INIT_RECORDS.len());
 
-    for record in &records {
-        assert!(matches!(record, DiagnosticRecord::Decoded { .. }));
-    }
+    let event = &entries[0];
+    assert_eq!(event.agent, "CLOUD_INIT");
+    assert_eq!(event.kind, DiagnosticKind::Finish);
+    assert_eq!(event.name, "modules-final/config-scripts_user");
+    assert_eq!(
+        event.vm_id.as_deref(),
+        Some("0e5e179d-5341-478b-8456-fbb90621bdf8")
+    );
+    assert_eq!(event.result.as_deref(), Some("SUCCESS"));
+    assert_eq!(
+        event.message,
+        "config-scripts_user ran successfully and took 0.001 seconds"
+    );
 
-    match &records[0] {
-        DiagnosticRecord::Decoded { event, chunks } => {
-            assert_eq!(*chunks, 1);
-            assert_eq!(event.agent, "CLOUD_INIT");
-            assert_eq!(event.kind, RecordKind::Finish);
-            assert_eq!(event.name, "modules-final/config-scripts_user");
-            assert_eq!(
-                event.vm_id.as_deref(),
-                Some("0e5e179d-5341-478b-8456-fbb90621bdf8")
-            );
-            assert_eq!(event.result.as_deref(), Some("SUCCESS"));
-            assert_eq!(
-                event.message,
-                "config-scripts_user ran successfully and took 0.001 seconds"
-            );
-        }
-        other => panic!("expected event, got {other:?}"),
-    }
-
-    match &records[1] {
-        DiagnosticRecord::Decoded { event, .. } => {
-            assert_eq!(event.kind, RecordKind::Start);
-            assert!(event.result.is_none());
-            assert!(event.duration.is_none());
-        }
-        other => panic!("expected event, got {other:?}"),
-    }
+    assert_eq!(entries[1].kind, DiagnosticKind::Start);
+    assert!(entries[1].result.is_none());
+    assert!(entries[1].duration.is_none());
 }
 
 #[test]
@@ -103,29 +89,17 @@ fn short_event_round_trips_as_single_record() {
     assert_eq!(dumped.len(), 1);
     assert!(dumped[0].0.ends_with("|0"), "key: {}", dumped[0].0);
 
-    let records = diag.records().unwrap();
-    assert_eq!(records.len(), 1);
-    match &records[0] {
-        DiagnosticRecord::Decoded {
-            event: decoded,
-            chunks,
-        } => {
-            assert_eq!(*chunks, 1);
-            assert_eq!(decoded.kind, RecordKind::Event);
-            assert_eq!(decoded.vm_id.as_deref(), Some(VM_ID));
-            assert_eq!(decoded.boot_epoch, diag.store().boot_epoch().unwrap());
-            assert_eq!(decoded.name, "user:create_user");
-            let event_id = uuid::Uuid::parse_str(&decoded.event_id)
-                .expect("event_id should be a valid UUID");
-            assert_eq!(
-                event_id.get_version_num(),
-                4,
-                "event_id should be a UUIDv4"
-            );
-            assert_eq!(decoded.message, "created");
-        }
-        other => panic!("expected event, got {other:?}"),
-    }
+    let entries = diag.entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    let decoded = &entries[0];
+    assert_eq!(decoded.kind, DiagnosticKind::Event);
+    assert_eq!(decoded.vm_id.as_deref(), Some(VM_ID));
+    assert_eq!(decoded.boot_epoch, diag.boot_epoch());
+    assert_eq!(decoded.name, "user:create_user");
+    let event_id = uuid::Uuid::parse_str(&decoded.event_id)
+        .expect("event_id should be a valid UUID");
+    assert_eq!(event_id.get_version_num(), 4, "event_id should be a UUIDv4");
+    assert_eq!(decoded.message, "created");
 }
 
 #[test]
@@ -149,18 +123,9 @@ fn long_event_splits_across_records_and_reassembles() {
     keys.dedup();
     assert_eq!(keys.len(), 4, "each chunk must have a unique key");
 
-    let records = diag.records().unwrap();
-    assert_eq!(records.len(), 1);
-    match &records[0] {
-        DiagnosticRecord::Decoded {
-            event: decoded,
-            chunks,
-        } => {
-            assert_eq!(*chunks, 4);
-            assert_eq!(decoded.message, message);
-        }
-        other => panic!("expected event, got {other:?}"),
-    }
+    let entries = diag.entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].message, message);
 }
 
 #[test]
@@ -179,26 +144,24 @@ fn multi_chunk_event_uses_unique_keys_so_host_keeps_all() {
     keys.dedup();
     assert_eq!(keys.len(), total, "chunk keys must be unique");
 
-    let events = diag.events().unwrap();
+    let events = diag.entries().unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].message, message);
 }
 
 #[test]
-fn injected_malformed_key_is_classified() {
+fn raw_and_malformed_records_are_skipped() {
     let dir = TempDir::new().unwrap();
     let diag = diagnostics(&dir);
 
     diag.store()
         .append(&format!("{PREFIX}|100|{VM_ID}|NOPE|bad:kind|id|ts"), "junk")
         .unwrap();
+    diag.store()
+        .append("PROVISIONING_REPORT", "result=success")
+        .unwrap();
 
-    let records = diag.records().unwrap();
-    assert_eq!(records.len(), 1);
-    assert!(matches!(
-        &records[0],
-        DiagnosticRecord::Malformed { reason, .. } if reason.contains("NOPE")
-    ));
+    assert!(diag.entries().unwrap().is_empty());
 }
 
 #[test]
@@ -216,65 +179,87 @@ fn mixed_records_round_trip_together() {
         .append(&format!("{PREFIX}|100|{VM_ID}|NOPE|e:f|id|ts"), "junk")
         .unwrap();
 
-    let records = diag.records().unwrap();
-    assert_eq!(records.len(), 4);
-    assert_eq!(diag.events().unwrap().len(), 2);
+    let entries = diag.entries().unwrap();
+    assert_eq!(entries.len(), 2);
 }
 
 #[test]
-fn clear_removes_events_but_keeps_raw() {
+fn explicit_diagnostic_kinds_are_tracing_ready() {
     let dir = TempDir::new().unwrap();
     let diag = diagnostics(&dir);
+    let timestamp = DateTime::parse_from_rfc3339("2026-08-31T12:34:56.789Z")
+        .unwrap()
+        .with_timezone(&Utc);
 
-    diag.emit_event("a:b", "e1").unwrap();
-    diag.emit_event("c:d", "z".repeat(MAX_CHUNK_BYTES * 2))
-        .unwrap();
-    diag.store()
-        .append("PROVISIONING_REPORT", "result=success")
-        .unwrap();
+    diag.emit(
+        DiagnosticKind::Start,
+        "provision:run",
+        "shared-span-id",
+        timestamp,
+        "starting",
+    )
+    .unwrap();
+    diag.emit(
+        DiagnosticKind::Event,
+        "provision:run",
+        "shared-span-id",
+        timestamp,
+        "progress",
+    )
+    .unwrap();
+    diag.emit(
+        DiagnosticKind::Finish,
+        "provision:run",
+        "shared-span-id",
+        timestamp,
+        "finished",
+    )
+    .unwrap();
+    diag.emit(
+        DiagnosticKind::Other("diagnostic".to_string()),
+        "support:bundle",
+        "diagnostic-id",
+        timestamp,
+        "collected",
+    )
+    .unwrap();
 
-    diag.clear().unwrap();
-
-    let records = diag.records().unwrap();
-    assert_eq!(records.len(), 1);
-    assert!(matches!(
-        &records[0],
-        DiagnosticRecord::Raw { key, .. } if key == "PROVISIONING_REPORT"
-    ));
-    assert!(diag.events().unwrap().is_empty());
+    let entries = diag.entries().unwrap();
+    assert_eq!(entries.len(), 4);
+    assert_eq!(entries[0].kind, DiagnosticKind::Start);
+    assert_eq!(entries[1].kind, DiagnosticKind::Event);
+    assert_eq!(entries[2].kind, DiagnosticKind::Finish);
+    assert_eq!(
+        entries[3].kind,
+        DiagnosticKind::Other("diagnostic".to_string())
+    );
+    assert!(entries[..3]
+        .iter()
+        .all(|entry| entry.event_id == "shared-span-id"));
+    assert!(entries.iter().all(|entry| entry.timestamp == timestamp));
 }
 
 #[test]
-fn clear_removes_all_diagnostics_regardless_of_scope() {
+fn chunked_entries_survive_store_swap_deletion() {
     let dir = TempDir::new().unwrap();
     let diag = diagnostics(&dir);
+    let first_message = "a".repeat(MAX_CHUNK_BYTES * 2 + 7);
+    let second_message = "b".repeat(MAX_CHUNK_BYTES * 2 + 7);
 
-    diag.emit_event("a:b", "mine").unwrap();
-    diag.store()
-        .append("other-agent|100|other-vm|event|x:y|id|ts", "theirs")
-        .unwrap();
-    diag.store()
-        .append("p|100|vm|NOPE|c:d|id|ts", "junk")
-        .unwrap();
-    diag.store()
-        .append("p|100|vm|NOPE|c:d|id|ts|0", "junk-0")
-        .unwrap();
-    diag.store()
-        .append("p|100|vm|NOPE|c:d|id|ts|1", "junk-1")
-        .unwrap();
-    diag.store()
-        .append("PROVISIONING_REPORT", "result=success")
-        .unwrap();
+    diag.emit_event("first", &first_message).unwrap();
+    diag.store().append("remove-me", "raw").unwrap();
+    diag.emit_event("second", &second_message).unwrap();
 
-    diag.clear().unwrap();
+    // Deletion moves the final record into the removed slot, so the second
+    // event's chunks are no longer adjacent or in index order.
+    assert!(diag.store().delete("remove-me").unwrap());
 
-    let records = diag.records().unwrap();
-    assert_eq!(records.len(), 1);
-    assert!(matches!(
-        &records[0],
-        DiagnosticRecord::Raw { key, .. } if key == "PROVISIONING_REPORT"
-    ));
-    assert!(diag.events().unwrap().is_empty());
+    let entries = diag.entries().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].name, "first");
+    assert_eq!(entries[0].message, first_message);
+    assert_eq!(entries[1].name, "second");
+    assert_eq!(entries[1].message, second_message);
 }
 
 #[test]
@@ -312,7 +297,7 @@ fn concurrent_multichunk_emits_reassemble_without_interleaving() {
         handle.join().unwrap();
     }
 
-    let events = diag.events().unwrap();
+    let events = diag.entries().unwrap();
     assert_eq!(events.len(), THREADS * PER_THREAD);
     for event in &events {
         assert_eq!(event.message.len(), len);
@@ -358,10 +343,10 @@ fn without_vm_id(current_key: &str) -> String {
     segments.join("|")
 }
 
-/// Append the given records to a fresh guest pool and classify them.
-fn records_of<K: AsRef<str>, V: AsRef<str>>(
+/// Append the given records to a fresh guest pool and normalize them.
+fn entries_of<K: AsRef<str>, V: AsRef<str>>(
     pairs: &[(K, V)],
-) -> Vec<DiagnosticRecord> {
+) -> Vec<DiagnosticEvent> {
     let dir = TempDir::new().unwrap();
     let store =
         KvpPoolStore::new_in(KvpPool::Guest, dir.path(), PoolMode::Safe)
@@ -369,46 +354,45 @@ fn records_of<K: AsRef<str>, V: AsRef<str>>(
     for (key, value) in pairs {
         store.append(key.as_ref(), value.as_ref()).unwrap();
     }
-    DiagnosticsKvp::new(store, "", "").records().unwrap()
+    DiagnosticsKvp::new(store, "", "")
+        .unwrap()
+        .entries()
+        .unwrap()
 }
 
-/// Expect exactly one decoded event, returning it with its chunk count.
-fn decode_single(records: Vec<DiagnosticRecord>) -> (DiagnosticEvent, usize) {
-    assert_eq!(records.len(), 1, "expected one record, got: {records:?}");
-    match records.into_iter().next().unwrap() {
-        DiagnosticRecord::Decoded { event, chunks } => (event, chunks),
-        other => panic!("expected a decoded event, got: {other:?}"),
-    }
+fn decode_single(entries: Vec<DiagnosticEvent>) -> DiagnosticEvent {
+    assert_eq!(entries.len(), 1, "expected one entry, got: {entries:?}");
+    entries.into_iter().next().unwrap()
 }
 
 #[rstest]
-#[case::start("start", "azure-ds", RecordKind::Start)]
-#[case::finish("finish", "azure-ds/get-metadata", RecordKind::Finish)]
-#[case::event("event", "user:create_user", RecordKind::Event)]
+#[case::start("start", "azure-ds", DiagnosticKind::Start)]
+#[case::finish("finish", "azure-ds/get-metadata", DiagnosticKind::Finish)]
+#[case::event("event", "user:create_user", DiagnosticKind::Event)]
 #[case::diagnostic(
     "diagnostic",
     "diagnostic message",
-    RecordKind::Other("diagnostic".to_string())
+    DiagnosticKind::Other("diagnostic".to_string())
 )]
 #[case::compressed(
     "compressed",
     "cloud-init.log",
-    RecordKind::Other("compressed".to_string())
+    DiagnosticKind::Other("compressed".to_string())
 )]
 #[case::boot_telemetry(
     "boot-telemetry",
     "boot-telemetry",
-    RecordKind::Other("boot-telemetry".to_string())
+    DiagnosticKind::Other("boot-telemetry".to_string())
 )]
 #[case::system_info(
     "system-info",
     "system information",
-    RecordKind::Other("system-info".to_string())
+    DiagnosticKind::Other("system-info".to_string())
 )]
 fn cloud_init_type_decodes_in_both_layouts(
     #[case] event_type: &str,
     #[case] name: &str,
-    #[case] expected: RecordKind,
+    #[case] expected: DiagnosticKind,
 ) {
     const TS: &str = "2026-08-06T20:20:13.479078Z";
     const UUID: &str = "b7a822ba-4eea-46c0-b559-e84396101132";
@@ -420,15 +404,14 @@ fn cloud_init_type_decodes_in_both_layouts(
     let old_key = format!("CLOUD_INIT|1786047606|{event_type}|{name}|{UUID}");
     let current_key = with_vm_id(&old_key, CLOUD_INIT_VM_ID);
 
-    let (event, chunks) = decode_single(records_of(&[(&old_key, &value)]));
-    assert_eq!(chunks, 1);
+    let event = decode_single(entries_of(&[(&old_key, &value)]));
     assert_eq!(event.agent, "CLOUD_INIT");
     assert_eq!(event.kind, expected);
     assert_eq!(event.vm_id, None);
     assert_eq!(event.name, name);
     assert_eq!(event.message, msg);
 
-    let (event, _) = decode_single(records_of(&[(&current_key, &value)]));
+    let event = decode_single(entries_of(&[(&current_key, &value)]));
     assert_eq!(event.kind, expected);
     assert_eq!(event.vm_id.as_deref(), Some(CLOUD_INIT_VM_ID));
     assert_eq!(event.message, msg);
@@ -443,8 +426,8 @@ fn cloud_init_finish_reports_result_and_duration_in_both_layouts() {
                    b7a822ba-4eea-46c0-b559-e84396101132";
 
     for key in [old_key.to_string(), with_vm_id(old_key, CLOUD_INIT_VM_ID)] {
-        let (event, _) = decode_single(records_of(&[(key.as_str(), value)]));
-        assert_eq!(event.kind, RecordKind::Finish);
+        let event = decode_single(entries_of(&[(key.as_str(), value)]));
+        assert_eq!(event.kind, DiagnosticKind::Finish);
         assert_eq!(event.result.as_deref(), Some("SUCCESS"));
         assert_eq!(event.duration, Some(0.1234));
     }
@@ -453,19 +436,17 @@ fn cloud_init_finish_reports_result_and_duration_in_both_layouts() {
 #[test]
 fn real_cloud_init_samples_decode_without_vm_id_too() {
     for &(key, value) in CLOUD_INIT_RECORDS {
-        let (event, _) =
-            decode_single(records_of(&[(without_vm_id(key), value)]));
+        let event = decode_single(entries_of(&[(without_vm_id(key), value)]));
         assert!(event.vm_id.is_none(), "stripped sample kept a vm_id: {key}");
     }
-    let (event, _) = decode_single(records_of(&[CLOUD_INIT_RECORDS[0]]));
+    let event = decode_single(entries_of(&[CLOUD_INIT_RECORDS[0]]));
     assert_eq!(event.vm_id.as_deref(), Some(CLOUD_INIT_VM_ID));
 }
 
 #[test]
 fn old_compressed_log_reassembles_across_chunks() {
-    let (event, chunks) = decode_single(records_of(COMPRESSED_LOG_CHUNKS));
-    assert_eq!(chunks, 3, "the three chunks must regroup into one event");
-    assert_eq!(event.kind, RecordKind::Other("compressed".to_string()));
+    let event = decode_single(entries_of(COMPRESSED_LOG_CHUNKS));
+    assert_eq!(event.kind, DiagnosticKind::Other("compressed".to_string()));
     assert_eq!(event.vm_id, None);
     assert_eq!(event.name, "cloud-init.log");
     assert_eq!(event.message, EXPECTED_COMPRESSED_MSG);
@@ -477,28 +458,52 @@ fn current_compressed_log_reassembles_across_chunks() {
         .iter()
         .map(|&(key, value)| (with_vm_id(key, CLOUD_INIT_VM_ID), value))
         .collect();
-    let (event, chunks) = decode_single(records_of(&current));
-    assert_eq!(chunks, 3);
-    assert_eq!(event.kind, RecordKind::Other("compressed".to_string()));
+    let event = decode_single(entries_of(&current));
+    assert_eq!(event.kind, DiagnosticKind::Other("compressed".to_string()));
     assert_eq!(event.vm_id.as_deref(), Some(CLOUD_INIT_VM_ID));
     assert_eq!(event.message, EXPECTED_COMPRESSED_MSG);
 }
 
 #[test]
-fn cloud_init_event_with_invalid_json_is_still_flagged() {
+fn cloud_init_event_with_invalid_json_is_skipped() {
     let key = format!(
         "CLOUD_INIT|1786047606|compressed|cloud-init.log|{CLOUD_INIT_VM_ID}|\
          b7a822ba-4eea-46c0-b559-e84396101132"
     );
-    let records = records_of(&[(key.as_str(), "not-json")]);
-    assert_eq!(records.len(), 1);
-    assert!(
-        matches!(
-            &records[0],
-            DiagnosticRecord::Malformed { reason, .. }
-                if reason.contains("invalid cloud-init JSON")
-        ),
-        "expected a Malformed record, got: {:?}",
-        records[0]
-    );
+    assert!(entries_of(&[(key.as_str(), "not-json")]).is_empty());
+}
+
+#[test]
+fn cloud_init_chunk_index_mismatch_is_skipped() {
+    let base = "CLOUD_INIT|1786047606|event|test|\
+                b7a822ba-4eea-46c0-b559-e84396101132";
+    let value = r#"{"name":"test","type":"event","ts":"2026-08-06T20:20:13Z","msg_i":1,"msg":"payload"}"#;
+
+    assert!(entries_of(&[(format!("{base}|0"), value)]).is_empty());
+}
+
+#[test]
+fn cloud_init_chunk_without_key_index_is_skipped() {
+    let key = "CLOUD_INIT|1786047606|event|test|\
+               b7a822ba-4eea-46c0-b559-e84396101132";
+    let value = r#"{"name":"test","type":"event","ts":"2026-08-06T20:20:13Z","msg_i":0,"msg":"partial"}"#;
+
+    assert!(entries_of(&[(key, value)]).is_empty());
+}
+
+#[test]
+fn incomplete_cloud_init_chunk_group_is_skipped() {
+    let base = "CLOUD_INIT|1786047606|event|test|\
+                b7a822ba-4eea-46c0-b559-e84396101132";
+    let chunk = |index: u32, message: &str| {
+        format!(
+            r#"{{"name":"test","type":"event","ts":"2026-08-06T20:20:13Z","msg_i":{index},"msg":"{message}"}}"#
+        )
+    };
+    let records = vec![
+        (format!("{base}|0"), chunk(0, "first")),
+        (format!("{base}|2"), chunk(2, "third")),
+    ];
+
+    assert!(entries_of(&records).is_empty());
 }

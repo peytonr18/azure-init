@@ -11,7 +11,7 @@ pub enum KvpError {
     EmptyKey,
     /// An underlying I/O error.
     Io(io::Error),
-    /// An event key field (`agent`, `vm_id`, `name`, or `event_id`)
+    /// An event key field (`agent`, `vm_id`, `kind`, `name`, or `event_id`)
     /// contained the `|` delimiter, which would make the formatted event
     /// key ambiguous to parse back.
     EventFieldContainsDelimiter { field: &'static str },
