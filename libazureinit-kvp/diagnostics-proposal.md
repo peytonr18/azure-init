@@ -1,271 +1,196 @@
 # KVP Diagnostics Proposal
 
-## Goal
+## What changes
 
-Hyper-V KVP stores physical key/value records that a guest exposes to its host. Azure-init and cloud-init use those records for diagnostics.
+Hyper-V KVP stores physical key/value records. It does not define chunking, diagnostics, or payload formats. This proposal does not change KVP.
 
-The proposal separates generic indexed values from diagnostic meaning, keeps each physical record available by default, and interprets payloads only when explicitly requested.
+Today, the diagnostic view reconstructs complete events and may omit incomplete groups. The proposal changes the default diagnostic view to return every recognized physical record with parsed metadata and its original value. Reconstruction and content decoding become optional.
 
-## Decisions requested
+The reader supports existing Azure-init and cloud-init records. The writer produces Azure-init records only.
 
-Please provide feedback on three decisions:
+## Components and composition
 
-1. **Layer boundary:** Keep KVP storage and diagnostics as the public layers. Keep indexed-value framing as a separate internal component until another use case needs it directly. Is that the intended separation?
-2. **Type and name:** The proposal gives `type` first-class key-level meaning: it describes what is reported about the subject identified by `name`, while a common `kind` is derived from it. Should `type` have this independent meaning, or should the common diagnostic view expose only `kind` and `name` and leave the producer's exact classification in the raw key or value?
-3. **Encoded content:** When content decoding is explicitly requested, choose one approach:
-   - **A — key-gated:** inspect an encoding envelope only when `type=compressed` indicates that encoded content is expected.
-   - **B — payload-directed:** inspect every requested payload for a validated `{encoding,data}` envelope.
-
-Under both approaches, the envelope determines the codec and ordinary reads do not decode content. If A is selected, should Azure-init also write `type=compressed`, and is the exact `type` sufficient or is a derived payload hint also useful?
-
-## Composition on top of KVP
-
-| Structure | Contains | Responsibility |
+| Component | Composed from | Responsibility |
 |---|---|---|
-| Physical KVP record | Key and value | Preserve exactly what was written. |
-| Indexed value | Base key plus physical parts numbered `0`, `1`, … | Split, identify, group, and order parts without interpreting their contents. |
-| Diagnostic entry | Raw key, parsed metadata, and raw value | Explain the diagnostic meaning of one physical record. |
-| Decoded diagnostic | Source entries plus decoded message or content | Optional source-specific combination and payload decoding. |
+| `KvpPoolStore` | One Hyper-V KVP pool | Read and write physical key/value records without diagnostic meaning |
+| Indexed framing | A base key and optional numeric `|index` suffixes | Split values for writing; group and order records only when reconstruction is requested |
+| `DiagnosticsPool` | One `KvpPoolStore` plus Azure-init writer identity | Read both source formats, write Azure-init diagnostics, and expose diagnostic entries |
+| `DiagnosticKey` | Metadata parsed from one Azure-init or cloud-init key | Provide one source-independent key model |
+| `DiagnosticEntry` | Raw key, `DiagnosticKey`, and unchanged value | Represent one physical diagnostic record |
+| Message and Content views | One or more `DiagnosticEntry` values | Optionally reconstruct a message and decode its declared content encoding |
+
+`DiagnosticsPool` is a diagnostic view over an existing `KvpPoolStore`; it does not replace the store or create another persisted format. It recognizes the Azure-init and cloud-init key layouts and converts either one into `DiagnosticKey`.
+
+Indexed framing is an internal rule, not diagnostic metadata. It understands only a base key, an index, and value fragments. It does not understand `kind`, `name`, JSON, or compression.
 
 ```text
-Diagnostics
-├── uses the existing KVP record layer
-├── uses indexed-value framing for |index
-└── optionally interprets grouped diagnostic values
+Read:
+KvpPoolStore
+  -> physical records
+  -> DiagnosticsPool parses each source key
+  -> DiagnosticEntry values                         [default]
+  -> indexed framing groups and orders entries      [Message requested]
+  -> DiagnosticsPool reconstructs the source value
+  -> encoding envelope is decoded                   [Content requested]
+
+Write:
+caller
+  -> DiagnosticsPool creates an Azure-init base key
+  -> indexed framing splits the value and adds indexes
+  -> KvpPoolStore writes the physical records
 ```
 
-Indexed framing understands only the numeric suffix. It does not understand `start`, `finish`, JSON, compression, or diagnostic names. Diagnostics defines the base key and knows how values from that source can be combined.
+The default `DiagnosticsPool` read returns one `DiagnosticEntry` for each recognized physical record; it does not group records. Its point-diagnostic write generates the event ID and timestamp. A lifecycle-aware write accepts `Start`, `Finish`, or `Diagnostic` and the caller's event metadata.
 
-Use “indexed” or “chunked” for a value spread across KVP records. This is unrelated to an operation span represented by `start` and `finish`.
+Raw KVP commands use `KvpPoolStore` directly. Parsed diagnostic commands use `DiagnosticsPool`. Message reconstruction and content decoding are requested views, not additional storage layers or stored data structures.
 
-## Key layouts
+## One normalized `DiagnosticKey`
 
-- Azure-init: `<agent>|<boot_epoch>|<vm_id>|<type>|<name>|<event_id>|<timestamp>[|<index>]`
-- Current cloud-init: `CLOUD_INIT|<boot_epoch>|<type>|<name>|<vm_id>|<event_id>[|<index>]`
-- Older cloud-init: `CLOUD_INIT|<boot_epoch>|<type>|<name>|<event_id>[|<index>]`
+New Azure-init records use:
 
-The source prefix selects the key layout; `type` does not. A numeric suffix is an index only when the remaining base key is a valid diagnostic key.
+```text
+<agent>|<boot_epoch>|<vm_id>|<kind>|<name>|<event_id>|<timestamp>[|<index>]
+```
 
-## Why each field exists
+Existing cloud-init records use:
 
-| Field | Why it is meaningful | Example |
+```text
+CLOUD_INIT|<boot_epoch>|<type>|<name>|<vm_id>|<event_id>[|<index>]
+CLOUD_INIT|<boot_epoch>|<type>|<name>|<event_id>[|<index>]
+```
+
+Both formats produce the same key model:
+
+```text
+DiagnosticKey {
+  agent, boot_epoch, vm_id?, kind, name,
+  event_id, timestamp?, chunk_index?
+}
+
+DiagnosticEntry { raw_key, key: DiagnosticKey, value }
+```
+
+| `DiagnosticKey` field | Azure-init source | Cloud-init source |
 |---|---|---|
-| `agent` | Identifies the writer and its key namespace. | `CLOUD_INIT`, `azure-init-0.1.1` |
-| `boot_epoch` | Separates records produced by different boots. | `1788371515` |
-| `vm_id` | Identifies the VM when records are collected outside the guest. | `e73baebd-...` |
-| `type` | Preserves the producer's exact classification. It can describe lifecycle, data category, or representation. | `start`, `system-info`, `compressed` |
-| `kind` | Gives consumers one common lifecycle view derived from `type`. It is not another encoded key field. | `Start`, `Finish`, `Diagnostic` |
-| `name` | Identifies the operation or data the record concerns. | `provision:run`, `dmesg` |
-| `event_id` | Identifies one emission and ties its physical parts together. Azure-init may reuse it to correlate a start and finish. | `operation-42` |
-| `timestamp` | Identifies when the occurrence happened. Azure-init stores it in the key; cloud-init stores it in the value. | `2026-09-02T17:52:00Z` |
-| `index` | Orders physical parts of one value. | `0`, `1`, `2` |
-| `value` | Carries the producer-owned message or structured payload. | `starting provisioning` |
+| `agent` | First key field | `CLOUD_INIT` |
+| `boot_epoch` | Key | Key |
+| `vm_id` | Key | Key, or absent in the older layout |
+| `kind` | Derived from key `kind` | Derived from key `type` |
+| `name` | Key | Key |
+| `event_id` | Key | Key |
+| `timestamp` | Key | Best-effort `ts` from the value |
+| `chunk_index` | Trailing numeric suffix | Trailing numeric suffix |
 
-## What `type` means compared with `name`
+The value is preserved unchanged. In the default view, cloud-init value parsing is used only to obtain its timestamp. Message and Content views interpret more of the value only when requested.
 
-`name` answers **“what is this record about?”** `type` adds context about **what is being reported about that subject**.
+| Field | Meaning and use | Example |
+|---|---|---|
+| `raw_key` | Preserve the exact source key for compatibility and inspection | Original `CLOUD_INIT|...` key |
+| `agent` | Identify the producer and its key namespace | `CLOUD_INIT`, `azure-init` |
+| `boot_epoch` | Identify when the VM boot began so records from different boots can be separated | `1788371515` |
+| `vm_id` | Identify the VM when records are exported or aggregated; absent from older cloud-init keys | `vm-123` |
+| `kind` | State the record's lifecycle role | `Start`, `Finish`, `Diagnostic` |
+| `name` | Identify the producer-defined operation or subject for filtering | `provision:run`, `dmesg` |
+| `event_id` | Identify one logical emission and tie all of its physical parts together | `event-1` |
+| `timestamp` | State when the occurrence was reported; optional when unavailable | `2026-09-02T17:52:25Z` |
+| `chunk_index` | Order the physical parts of one value | `0`, `1`, `2` |
+| `value` | Preserve the producer-owned message or structured payload | `Retrieved 1 key from IMDS` |
 
-| `type` | `name` | Meaning | Derived `kind` |
-|---|---|---|---|
-| `start` | `provision:run` | The `provision:run` operation began. | `Start` |
-| `finish` | `provision:run` | The same operation completed. | `Finish` |
-| `diagnostic` | `user:create_user` | Point-in-time data about creating a user. | `Diagnostic` |
-| `system-info` | `system information` | Point-in-time system information. | `Diagnostic` |
-| `compressed` | `dmesg` | Diagnostic data named `dmesg` is represented as encoded content. | `Diagnostic` |
+An `event_id` always groups parts of one emission. It correlates separate `Start` and `Finish` records only when the producer explicitly guarantees that convention.
 
-`type` changes the meaning of the **record**, but it does not rename, parse, or otherwise change `name`. The same name can have different lifecycle types, and the same type can be used with many names.
+## `kind` compared with `name`
 
-The exact `type` is retained so `compressed`, `system-info`, and future producer-defined values are not lost. A normalized `kind` is derived as follows:
+`kind` answers “what role does this record have?” `name` answers “what is this record about?”
 
-- `start` → `Start`
-- `finish` → `Finish`
-- every other type → `Diagnostic`
+| `kind` | `name` | Meaning |
+|---|---|---|
+| `Start` | `provision:run` | The named operation began |
+| `Diagnostic` | `provision:run` | A point-in-time observation about the operation |
+| `Finish` | `provision:run` | The named operation finished |
+| `Diagnostic` | `dmesg` | Point-in-time diagnostic data named `dmesg` |
 
-## Expected cloud-init telemetry
+`kind` does not rename `name` and does not select a value parser. Results, durations, and other details remain in the producer-owned value.
 
-The diagnostic view recognizes both current and older cloud-init key layouts and does not restrict `type` to a fixed allowlist. These are the known telemetry types supported explicitly:
+Azure-init calls its classification `kind`; cloud-init calls it `type`. Each known token means:
 
-The VM and event IDs below are shortened for readability; cloud-init normally writes UUIDs.
+| Source token | Exact source meaning | Common `kind` |
+|---|---|---|
+| `start` | The operation identified by `name` began | `Start` |
+| `finish` | The operation identified by `name` ended | `Finish` |
+| `event` | Legacy point-in-time event | `Diagnostic` |
+| `diagnostic` | Point-in-time diagnostic observation | `Diagnostic` |
+| `system-info` | System, OS, or agent information | `Diagnostic` |
+| `boot-telemetry` | Boot timing or boot-related information | `Diagnostic` |
+| `compressed` | Legacy cloud-init label for an encoded diagnostic payload | `Diagnostic` |
+| Any other value | Producer-defined or unknown classification | `Diagnostic` |
 
-| Cloud-init `type` | Purpose | Expected value fields | Derived `kind` |
-|---|---|---|---|
-| `start` | An operation began. | `name`, `type`, `ts`, `msg` | `Start` |
-| `finish` | An operation completed. | `name`, `type`, `ts`, `result`, `duration`, `msg` | `Finish` |
-| `event` | Existing point-event format. | `name`, `type`, `ts`, `msg` | `Diagnostic` |
-| `diagnostic` | Point-in-time diagnostic message. | `name`, `type`, `ts`, `msg` | `Diagnostic` |
-| `system-info` | OS, kernel, distribution, and cloud-init information. | `name`, `type`, `ts`, `msg` | `Diagnostic` |
-| `boot-telemetry` | Kernel, userspace, and cloud-init boot timing. | `name`, `type`, `ts`, `msg` | `Diagnostic` |
-| `compressed` | Encoded diagnostic content such as `dmesg` or `cloud-init.log`. | `name`, `type`, `ts`, optional `msg_i`, `msg` | `Diagnostic` |
-| Any other value | Future producer-defined telemetry. | Producer-defined | `Diagnostic` |
+The token changes the record's lifecycle meaning only for `start` and `finish`. It never changes how `name` is interpreted. The original source token remains available in `raw_key`; it does not select a value parser in the common model. In particular, compression is a payload encoding, not a lifecycle kind.
 
-The value-field list documents known cloud-init output; ordinary reads retain the complete value even when a field is missing or malformed.
+## Proposed read behavior
 
-### Operation start
+| Command | Result |
+|---|---|
+| `read <key>` | The raw value for that exact KVP key |
+| `dump` | Every physical key/value record in pool order |
+| `dump --parse-diagnostics` | One parsed record per recognized physical record, including its chunk index and unchanged value |
+| `dump --parse-diagnostics --view message` | Reconstruct the source message when its indexed records are available |
+| `dump --parse-diagnostics --view content` | Decode a validated encoding envelope such as `{"encoding":"gz+b64","data":"..."}` |
 
-```text
-CLOUD_INIT|1788371515|start|modules-final/config-install_hotplug|vm-123|event-1
-```
+Raw parsed diagnostics are the default. `--name` filters by diagnostic name, and `--tail` counts physical records in this view. JSON output keeps the original value as a string.
 
-```json
-{"name":"modules-final/config-install_hotplug","type":"start","ts":"2026-09-02T17:52:24.256376Z","msg":"running config-install_hotplug"}
-```
+If Message or Content processing fails, that request falls back to the available Raw records rather than hiding them.
 
-This means the named operation began. `type=start` supplies the lifecycle meaning; `name` identifies the operation.
+The existing suffix format has no total-part count. Gaps and duplicate indexes can be detected, but a missing final part cannot always be detected; reconstruction of existing records is therefore best effort.
 
-### Operation finish
+## End-to-end example
 
-```text
-CLOUD_INIT|1788371515|finish|modules-final/config-install_hotplug|vm-123|event-2
-```
-
-```json
-{"name":"modules-final/config-install_hotplug","type":"finish","ts":"2026-09-02T17:52:24.257560Z","result":"SUCCESS","duration":0.0012,"msg":"config-install_hotplug ran successfully"}
-```
-
-This means the same named operation completed. Cloud-init may assign start and finish different event IDs; matching names describe the same operation but do not by themselves prove correlation.
-
-### Diagnostic message
+Write one Azure-init point diagnostic:
 
 ```text
-CLOUD_INIT|1788371515|diagnostic|diagnostic message|vm-123|event-3
+libazureinit-kvp emit --prefix azure-init --vm-id vm-123 --name imds --message "Retrieved 1 key from IMDS"
 ```
 
-```json
-{"name":"diagnostic message","type":"diagnostic","ts":"2026-09-02T17:52:25Z","msg":"Ephemeral resource disk exists."}
-```
-
-This is point-in-time data. Repeated diagnostic messages remain separate emissions because each has its own event ID.
-
-### System information
+The command uses the supplied agent and VM ID, generates the boot epoch, event ID, and timestamp, then writes:
 
 ```text
-CLOUD_INIT|1788371515|system-info|system information|vm-123|event-4
+azure-init|1788371515|vm-123|diagnostic|imds|event-1|2026-09-02T17:52:25Z|0
+value: Retrieved 1 key from IMDS
 ```
 
-```json
-{"name":"system information","type":"system-info","ts":"2026-09-02T17:52:26Z","msg":"cloudinit_version=26.1, kernel_version=6.8.0-azure, distro_name=ubuntu"}
-```
-
-The exact `system-info` type is retained while its common kind is `Diagnostic`.
-
-### Boot telemetry
+An exact-key read returns:
 
 ```text
-CLOUD_INIT|1788371515|boot-telemetry|boot-telemetry|vm-123|event-5
+Retrieved 1 key from IMDS
 ```
 
-```json
-{"name":"boot-telemetry","type":"boot-telemetry","ts":"2026-09-02T17:52:27Z","msg":"kernel_start=... user_start=... cloudinit_activation=..."}
-```
-
-This carries point-in-time boot timing data and also derives `kind=Diagnostic`.
-
-### Existing `event` compatibility
+A parsed diagnostic read returns:
 
 ```text
-CLOUD_INIT|1788371515|event|user:create_user|vm-123|event-6
+kind=Diagnostic agent=azure-init boot_epoch=1788371515 vm_id=vm-123 name=imds event_id=event-1 timestamp=2026-09-02T17:52:25Z chunk_index=0 value="Retrieved 1 key from IMDS"
 ```
 
-```json
-{"name":"user:create_user","type":"event","ts":"2026-09-02T17:52:28Z","msg":"Created user azureuser"}
-```
-
-`event` remains supported and maps to `Diagnostic`; it is not rejected when `diagnostic` is also supported.
-
-### Compressed, indexed content
+A long value may produce two physical records:
 
 ```text
-CLOUD_INIT|1788371515|compressed|dmesg|vm-123|event-7|0
-CLOUD_INIT|1788371515|compressed|dmesg|vm-123|event-7|1
+<same-base-key>|0 = "Retrieved "
+<same-base-key>|1 = "1 key from IMDS"
 ```
 
-```json
-{"name":"dmesg","type":"compressed","ts":"2026-09-02T17:52:29Z","msg_i":0,"msg":"{\"encoding\":\"gz+b64\",\"data\":\"first-fragment"}
-{"name":"dmesg","type":"compressed","ts":"2026-09-02T17:52:29Z","msg_i":1,"msg":"second-fragment\"}"}
-```
-
-Ordinary reads return both physical records. A real split may occur inside an escape and make one value invalid JSON by itself. Optional decoding validates the key and value indices, joins the escaped `msg` fragments, and then interprets the completed envelope according to Decision 3.
-
-### Older layout and unknown types
-
-Older cloud-init records omit `vm_id`:
+The default diagnostic view returns both records. Message view returns one value:
 
 ```text
-CLOUD_INIT|1788371515|diagnostic|diagnostic message|event-8
+Retrieved 1 key from IMDS
 ```
 
-The older layout is accepted for every telemetry type listed above.
+If part 0 is missing, part 1 remains visible in the default view and no reconstructed message is claimed.
 
-Unknown types remain visible rather than being rejected:
+Existing cloud-init records follow the same read contract. Their key metadata is normalized, while their original key and JSON value remain unchanged.
 
-```text
-CLOUD_INIT|1788371515|future-type|future diagnostic|vm-123|event-9
-```
+## Feedback requested
 
-The first record has no VM ID. The second retains `type=future-type` and derives `kind=Diagnostic`.
+Please confirm these four decisions:
 
-## Clear use cases
-
-### 1. One operation starts and finishes
-
-```text
-azure-init|1788371515|vm-123|start|provision:run|operation-42|2026-09-02T17:52:00Z|0
-value: starting provisioning
-
-azure-init|1788371515|vm-123|finish|provision:run|operation-42|2026-09-02T17:52:24Z|0
-value: provisioning completed
-```
-
-- `type` changes from `start` to `finish` because two different lifecycle occurrences are being reported.
-- `name` stays `provision:run` because both records concern the same operation.
-- `event_id` correlates the occurrences.
-- `timestamp` says when each occurred.
-- `index=0` says each value fits in one physical record.
-- The values remain simple messages because identity and lifecycle metadata are already in the keys.
-
-### 2. The same type describes different diagnostics
-
-```text
-azure-init|1788371515|vm-123|diagnostic|user:create_user|event-1|2026-09-02T17:52:25Z|0
-value: created user azureuser
-
-azure-init|1788371515|vm-123|diagnostic|network:configure|event-2|2026-09-02T17:52:26Z|0
-value: configured eth0
-```
-
-Both records are point-in-time diagnostics, but their names identify different subjects. This demonstrates that `type` does not determine `name`.
-
-### 3. One value spans physical records
-
-```text
-azure-init|1788371515|vm-123|diagnostic|config:dump|event-4|2026-09-02T17:52:28Z|0
-value: first fragment
-
-azure-init|1788371515|vm-123|diagnostic|config:dump|event-4|2026-09-02T17:52:28Z|1
-value: second fragment
-```
-
-The base key is identical and only the index changes. Indexed framing can group and order the records without knowing they are diagnostics. The diagnostic layer knows that Azure-init values can be concatenated. Ordinary reads still return both physical records independently.
-
-## Read and decode behavior
-
-Ordinary diagnostic reads:
-
-- Return one entry for each recognized physical diagnostic record, in pool order.
-- Preserve the complete raw key and value.
-- Parse available key metadata.
-- Best-effort read cloud-init's timestamp without replacing or decoding its message.
-- Retain duplicate, gapped, and incomplete indexed records.
-- Omit unrelated records and records whose keys are malformed. The raw KVP view remains available when every pool record is needed.
-
-Optional decoding is a separate request:
-
-- Group only records with the same complete base key.
-- Require unique, contiguous indices beginning at zero.
-- Validate cloud-init's value index against the key index.
-- Combine values according to their source: concatenate Azure-init fragments, or extract and combine cloud-init `msg` fragments.
-- Return an explicit error while preserving the source records when combination or decoding fails.
-
-The format has no total-part count, so a missing final fragment cannot always be detected. A physical cloud-init part may also be invalid JSON because a split can occur inside an escaped `msg`; that does not prevent the physical record from being returned.
-
-Existing Azure-init `type=event` records remain readable and derive `kind=Diagnostic`; new point diagnostics use `type=diagnostic`. Unknown types are retained exactly and also derive `kind=Diagnostic`.
+1. Keep physical KVP, indexed framing, and diagnostics as separate concepts, while leaving indexed framing internal for now.
+2. Use only `Start`, `Finish`, and `Diagnostic` in the common model. Preserve cloud-init's exact `type` in the raw key rather than assigning it cross-source semantics.
+3. Make one physical diagnostic record the default result and request higher-level processing with `--view message` or `--view content`.
+4. Treat encoding as a validated value envelope rather than `type=compressed`; if a higher-level view fails, preserve the available physical records.
