@@ -199,7 +199,7 @@ Standard base64 of the raw payload bytes, for binary that will not shrink useful
 
 #### gz+b64
 
-base64 of gzip of the raw payload bytes, for a large compressible artifact such as `dmesg`. Writing gzips the payload, base64-encodes the result, then chunks it; decoding joins the chunks, base64-decodes, and gunzips. It is one gzip stream spread across the chunks, so any missing chunk makes the whole artifact `Undecodable` (see Reads and writes), the cost it trades for far fewer records.
+base64 of gzip of the raw payload bytes, for a large compressible artifact such as `dmesg`. Writing gzips the payload, base64-encodes the result, then chunks it; decoding joins the chunks, base64-decodes, and gunzips. It is one gzip stream spread across the chunks, so a missing chunk makes the whole artifact unavailable: a visible index gap is `IncompleteGroup`, while a contiguous truncation is detected during decoding as `Undecodable`. That is the cost it trades for far fewer records.
 
 ### Reads and writes
 
@@ -244,7 +244,13 @@ Write:
 
 ```mermaid
 flowchart TD
-  emit["DiagnosticWriter::emit_*<br/>kind, name, payload"] --> encsel{"encoding<br/>(caller's choice)"}
+  client["Provisioning client"] --> new["DiagnosticWriter::new<br/>store, agent, vm_id"]
+  new --> init{"identity valid and<br/>boot epoch readable?"}
+  init -->|"no"| initerr["Err(KvpError)<br/>writer not constructed"]
+  init -->|"yes"| emit["DiagnosticWriter::emit_*<br/>kind, name, payload"]
+  emit --> valid{"fields, kind invariants,<br/>and encoding valid?"}
+  valid -->|"no"| inputerr["Err(KvpError)<br/>nothing written"]
+  valid -->|"yes"| encsel{"encoding<br/>(caller's choice)"}
   encsel -->|"gz+b64"| gz["gzip then base64"]
   encsel -->|"b64"| b64["base64"]
   encsel -->|"none"| plain["text as-is"]
@@ -252,33 +258,55 @@ flowchart TD
   b64 --> frame
   plain --> frame
   frame --> keys["stamp AZURE_INIT_V1<br/>and format chunk keys"]
-  keys --> append["append all chunks under one store lock"]
-  append --> store[("KvpPoolStore<br/>flat key=value pool")]
+  keys --> limits{"key and chunk-count<br/>limits satisfied?"}
+  limits -->|"no"| inputerr
+  limits -->|"yes"| append["KvpPoolStore::append_multiple<br/>all chunks under one lock"]
+  append -->|"ok"| store[("KvpPoolStore<br/>flat key=value pool")]
+  store --> ok["Ok(())"]
+  append -->|"lock / write / flush error"| writeerr["Err(KvpError)<br/>batch may be partial"]
 ```
 
 Read (`DiagnosticReader::entries()`):
 
 ```mermaid
 flowchart TD
-  store[("KvpPoolStore<br/>flat key=value pool")] --> reader["DiagnosticReader::entries()"]
-  reader --> cls{"first key field"}
-  cls -->|"AZURE_INIT_V1"| dec["group chunks,<br/>decode by encoding"]
-  cls -->|"unsupported AZURE_INIT_V*"| rawver["Raw {key, value,<br/>UnsupportedVersion}"]
+  client["Diagnostic consumer / CLI"] --> new["DiagnosticReader::new(store)<br/>no IO, cannot fail"]
+  new --> entries["DiagnosticReader::entries()"]
+  entries --> dump["KvpPoolStore::dump()"]
+  dump -->|"lock / read error"| readerr["Err(KvpError)<br/>no entries returned"]
+  dump -->|"ok"| cls{"first key field"}
+  cls -->|"AZURE_INIT_V1"| dec["source parser<br/>parse, group, decode"]
+  cls -->|"unsupported AZURE_INIT_V*"| rawver["Entry::Raw<br/>UnsupportedVersion"]
   cls -->|"CLOUD_INIT"| bridge["cloud-init bridge"]
   bridge --> dec
   cls -->|"PROVISIONING_REPORT"| rep["parse report"]
-  cls -->|"neither"| raw["Raw {key, value}"]
+  cls -->|"neither"| raw["Entry::Raw<br/>error: None"]
   dec -->|"ok"| diag["Entry::Diagnostic"]
-  dec -->|"incomplete / duplicate / undecodable"| rawerr["Raw {key, value, error}"]
+  dec -->|"bad key or source value"| malformed["Entry::Raw<br/>Malformed"]
+  dec -->|"missing chunk"| incomplete["Entry::Raw<br/>IncompleteGroup"]
+  dec -->|"duplicate index"| duplicate["Entry::Raw<br/>DuplicateChunk"]
+  dec -->|"unknown encoding / bad data"| undecodable["Entry::Raw<br/>Undecodable"]
   rep -->|"ok"| repe["Entry::Report"]
-  rep -->|"malformed"| rawerr
+  rep -->|"malformed"| malformed
+  rawver --> out["Ok(Vec&lt;Entry&gt;)"]
+  raw --> out
+  diag --> out
+  malformed --> out
+  incomplete --> out
+  duplicate --> out
+  undecodable --> out
+  repe --> out
 ```
+
+`KvpError` and `DecodeError` mark different boundaries. A `KvpError` means the requested construction, read, or write could not complete and is returned by the method. A `DecodeError` means the pool read succeeded but stored data could not be interpreted; `entries()` still succeeds and preserves that data as `Entry::Raw` with the reason.
+
+The writer prepares and validates the complete batch before calling the store, so an identity, field, encoding, or size error writes nothing. Once `append_multiple` begins, a lock, write, or flush error returns `KvpError` but may leave part of the batch in the pool. A reader reports a visible index gap as `IncompleteGroup` and invalid encoded content as `Undecodable`. A contiguous prefix of a `none` payload has neither condition and cannot be distinguished from a complete value because this format carries no total chunk count.
 
 The `diagnostic_version_id` is part of every azure-init group key, so chunks from different schemas can never combine. The rest of the group key includes `kind` because a span's start and finish share an `event_id`. There is no decode-time size limit either: the producer is trusted and the pool bounds the input, so an artifact either fits when it is written or is never written.
 
 ## Crate design
 
-The crate exposes two interfaces over `KvpPoolStore`; neither holds files or locks, and both delegate all IO to the store. A provisioning client writes through `DiagnosticWriter`, while a diagnostic consumer reads through `DiagnosticReader`; a caller that wants untyped records uses the store directly. The writer produces azure-init records only. The reader understands supported azure-init versions and reads cloud-init through the bridge. The format and behavior are in Proposed design; the types, API, and CLI are here.
+The crate exposes two interfaces over `KvpPoolStore`; neither holds files or locks, and both delegate all IO to the store. `DiagnosticWriter` is the provisioning clients' producer interface: clients provide diagnostic meaning and payload, but do not construct keys, frame chunks, or append diagnostic records directly. A diagnostic consumer reads through `DiagnosticReader`; a caller that wants untyped records uses the store directly. The writer produces azure-init records only. The reader understands supported azure-init versions and reads cloud-init through the bridge. The format and behavior are in Proposed design; the types, API, and CLI are here.
 
 Their initialization is deliberately asymmetric. `DiagnosticReader` needs only a store because every source, identity, boot, and format decision comes from the records it reads; constructing one performs no IO. `DiagnosticWriter` needs the store plus the local `agent` and `vm_id`, validates that stable producer identity once, and obtains the boot epoch once for every record it will emit. It always writes the crate's current `AZURE_INIT_V1` format; callers cannot select a version or ask it to write cloud-init records. A process that needs both interfaces constructs them from clones of the same `KvpPoolStore`.
 
