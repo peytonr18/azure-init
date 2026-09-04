@@ -96,10 +96,11 @@ This proposal defines one versioned diagnostic record format, emitted here by az
 The proposed key is the current azure-init key with a few changes, all keeping metadata in the key. It is pipe-delimited with `|` reserved, begins with a diagnostic schema-version identifier, and always ends with the chunk index, so a single-record value still ends in `|0`:
 
 ```text
-DIAG_V1|<agent>|<boot_epoch>|<vm_id>|<kind>|<name>|<event_id>|<timestamp>|<encoding>|<result>|<duration>|<chunk_index>
+DIAG_V1|<agent>|<vm_id>|<kind>|<name>|<event_id>|<timestamp>|<encoding>|<result>|<duration>|<chunk_index>
 ```
 
 - `DIAG_V1` is the `diagnostic_version_id`: `DIAG` identifies the general diagnostics family and `V1` identifies version 1 of its wire schema. It does not identify the producer; `agent` continues to do that. The schema covers the field layout, required and optional fields, token meanings, units, encoding rules, and chunk framing. It is one self-identifying token rather than a bare number because the pool also contains unrelated keys: a reader can recognize an unsupported future `DIAG_V*` record without mistaking an arbitrary numeric key for a diagnostic. A schema change requires a new `diagnostic_version_id`; an agent release by itself does not.
+- The previous `boot_epoch` field is removed. Each diagnostic already carries an absolute timestamp, while stale-pool cleanup owns removal of records from prior boots; the schema does not duplicate that boot identity.
 - `type` becomes `kind`, narrowed to the three timeline positions (`start`/`finish`/`event`); any other category is carried by `name`, `encoding`, or `result`, not a token.
 - `encoding` names the payload encoding in the key so a large artifact can be compressed.
 - `result` and `duration` are the finish's verdict fields, carried in the key: `result` is a `success`/`fail` token and `duration` is the elapsed milliseconds. Both are required on a finish, optional on an event, and empty on a start. Everything else, including the plain-text value, is unchanged.
@@ -108,7 +109,6 @@ DIAG_V1|<agent>|<boot_epoch>|<vm_id>|<kind>|<name>|<event_id>|<timestamp>|<encod
 |---|---|
 | diagnostic_version_id | `DIAG_V1`; identifies the wire schema and selects its parser before any later field is interpreted |
 | agent | Producer identifier, such as `azure-init-0.1.1` |
-| boot_epoch | Unix seconds of the boot that produced the record |
 | vm_id | VM identity |
 | kind | `start` or `finish` for a span, `event` for a point observation |
 | name | Subject, such as `provision:run` or `dmesg` |
@@ -121,7 +121,7 @@ DIAG_V1|<agent>|<boot_epoch>|<vm_id>|<kind>|<name>|<event_id>|<timestamp>|<encod
 
 #### Key size
 
-The whole key is one string, and the host silently truncates a guest-written key past 254 UTF-8 bytes; safe-mode `KvpPoolStore` rejects it first. The fixed fields spend most of that budget: `vm_id` and `event_id` at 36 bytes each plus the 24-byte `timestamp` are already 96 bytes, and `DIAG_V1` adds another 7 before the enums, numbers, and delimiters. A representative finish key runs about 184 bytes, leaving roughly 70 for the two free-form fields.
+The whole key is one string, and the host silently truncates a guest-written key past 254 UTF-8 bytes; safe-mode `KvpPoolStore` rejects it first. The fixed fields spend most of that budget: `vm_id` and `event_id` at 36 bytes each plus the 24-byte `timestamp` are already 96 bytes, and `DIAG_V1` adds another 7 before the enums, numbers, and delimiters. A representative finish key runs about 173 bytes, leaving roughly 81 before the limit.
 
 Only `agent` and `name` are free-form; every other field is bounded by its format or its enum. The writer caps the two so the whole key cannot exceed 254 bytes:
 
@@ -132,11 +132,11 @@ Only `agent` and `name` are free-form; every other field is bounded by its forma
 | name | 48 B | free-form subject |
 | vm_id, event_id | 36 B each | GUID / UUID |
 | timestamp | 24 B | fixed format |
-| boot_epoch, duration | 10 B each | digits |
+| duration | 10 B | digits |
 | result, encoding, kind | ≤ 7 B each | enum token |
 | chunk_index | 4 B | at most 1023 records |
 
-With those caps the worst-case key is 237 bytes, leaving 17 bytes inside the limit. cloud-init reads are never capped; the bridge takes names as they are.
+With those caps the worst-case key is 226 bytes, leaving 28 bytes inside the limit. cloud-init reads are never capped; the bridge takes names as they are.
 
 ### Kinds
 
@@ -151,7 +151,7 @@ A `start` opens a span, an operation that takes measurable time such as `provisi
 It shares one `event_id` with its `finish`; that shared id is what ties the pair, so a `start` whose `finish` never arrives stands out as an operation that began but never ended, exactly the signal an operator wants after a hang or crash.
 
 ```text
-DIAG_V1|azure-init-0.1.1|1700000000|vm-abc|start|provision:run|9c1d2e3f-...|2026-08-31T12:34:56.789Z|none|||0   value: starting
+DIAG_V1|azure-init-0.1.1|vm-abc|start|provision:run|9c1d2e3f-...|2026-08-31T12:34:56.789Z|none|||0   value: starting
 ```
 
 #### finish
@@ -159,7 +159,7 @@ DIAG_V1|azure-init-0.1.1|1700000000|vm-abc|start|provision:run|9c1d2e3f-...|2026
 A `finish` closes the span it shares an `event_id` with. Its `timestamp` is later than the start's, and it reports the operation's outcome directly in the key: `result` is `success` or `fail`, and `duration` is the elapsed milliseconds. The writer holds the start instant, so it stamps `duration` at emit time rather than making a reader pair the two records to recover it, and a truncated pool that kept only the finish still carries both the verdict and the elapsed time. The value stays a human message such as `provisioning succeeded` or `provisioning failed: <reason>`. cloud-init carries the same fields in its value JSON, which the bridge maps across (see Compatibility).
 
 ```text
-DIAG_V1|azure-init-0.1.1|1700000000|vm-abc|finish|provision:run|9c1d2e3f-...|2026-08-31T12:34:57.101Z|none|success|312|0   value: provisioning succeeded
+DIAG_V1|azure-init-0.1.1|vm-abc|finish|provision:run|9c1d2e3f-...|2026-08-31T12:34:57.101Z|none|success|312|0   value: provisioning succeeded
 ```
 
 #### event
@@ -170,17 +170,17 @@ Its value is the observed payload, read per `encoding`: a short text as `none`, 
 
 ```text
 # plain text, one record
-DIAG_V1|azure-init-0.1.1|1700000000|vm-abc|event|imds|8f3e...|2026-07-27T21:33:24.300Z|none|||0   value: Retrieved 1 key from IMDS
+DIAG_V1|azure-init-0.1.1|vm-abc|event|imds|8f3e...|2026-07-27T21:33:24.300Z|none|||0   value: Retrieved 1 key from IMDS
 
 # an event that is itself a failure sets result
-DIAG_V1|azure-init-0.1.1|1700000000|vm-abc|event|imds|7b2c...|2026-07-27T21:33:24.400Z|none|fail||0   value: IMDS unreachable
+DIAG_V1|azure-init-0.1.1|vm-abc|event|imds|7b2c...|2026-07-27T21:33:24.400Z|none|fail||0   value: IMDS unreachable
 
 # a self-contained timing sets duration but no result
-DIAG_V1|azure-init-0.1.1|1700000000|vm-abc|event|imds:probe|5d6e...|2026-07-27T21:33:24.500Z|none||52|0   value: probed IMDS in 52ms
+DIAG_V1|azure-init-0.1.1|vm-abc|event|imds:probe|5d6e...|2026-07-27T21:33:24.500Z|none||52|0   value: probed IMDS in 52ms
 
 # compressed artifact, split across records, indices 0..N
-DIAG_V1|azure-init-0.1.1|1700000000|vm-abc|event|dmesg|9a1b...|<ts>|gz+b64|||0   value: <base64 of gzip, chunk 0>
-DIAG_V1|azure-init-0.1.1|1700000000|vm-abc|event|dmesg|9a1b...|<ts>|gz+b64|||1   value: <chunk 1>
+DIAG_V1|azure-init-0.1.1|vm-abc|event|dmesg|9a1b...|<ts>|gz+b64|||0   value: <base64 of gzip, chunk 0>
+DIAG_V1|azure-init-0.1.1|vm-abc|event|dmesg|9a1b...|<ts>|gz+b64|||1   value: <chunk 1>
 ```
 
 ### Payloads
@@ -256,7 +256,7 @@ Write:
 ```mermaid
 flowchart TD
   client["Provisioning client"] --> new["DiagnosticWriter::new<br/>store, agent, vm_id"]
-  new --> init{"identity valid and<br/>boot epoch readable?"}
+  new --> init{"producer identity valid?"}
   init -->|"no"| initerr["Err(KvpError)<br/>writer not constructed"]
   init -->|"yes"| emit["DiagnosticWriter::emit_*<br/>text or byte payload"]
   emit --> valid{"fields, kind invariants,<br/>payload, and encoding valid?"}
@@ -317,7 +317,7 @@ The `diagnostic_version_id` is part of every diagnostic group key, so chunks fro
 
 The crate exposes two interfaces over `KvpPoolStore`; neither holds files or locks, and both delegate all IO to the store. `DiagnosticWriter` is the provisioning clients' producer interface: clients provide diagnostic meaning and payload, but do not construct keys, frame chunks, or append diagnostic records directly. A diagnostic consumer reads through `DiagnosticReader`; a caller that wants untyped records uses the store directly. The writer produces azure-init records only. The reader understands supported diagnostics versions and reads cloud-init through the bridge. The format and behavior are in Proposed design; the types, API, and CLI are here.
 
-Their initialization is deliberately asymmetric. `DiagnosticReader` needs only a store because every source, identity, boot, and format decision comes from the records it reads; constructing one performs no IO. `DiagnosticWriter` needs the store plus the local `agent` and `vm_id`, validates that stable producer identity once, and obtains the boot epoch once for every record it will emit. It always writes the crate's current `DIAG_V1` format; callers cannot select a version or ask it to write cloud-init records. A process that needs both interfaces constructs them from clones of the same `KvpPoolStore`.
+Their initialization is deliberately asymmetric. `DiagnosticReader` needs only a store because every source, identity, and format decision comes from the records it reads. `DiagnosticWriter` also needs the local `agent` and `vm_id` and validates that stable producer identity once. Neither constructor reads the pool or resolves boot state. The writer always writes the crate's current `DIAG_V1` format; callers cannot select a version or ask it to write cloud-init records. A process that needs both interfaces constructs them from clones of the same `KvpPoolStore`.
 
 ```rust
 const DIAGNOSTIC_VERSION_ID: &str = "DIAG_V1";
@@ -357,7 +357,6 @@ enum DecodeError {
 /// The reader consumes the schema ID while selecting a parser, then every supported source maps here.
 struct DiagnosticKey {
     agent: String,
-    boot_epoch: i64,
     /// Older cloud-init keys omit it.
     vm_id: Option<String>,
     name: String,
@@ -408,7 +407,6 @@ struct DiagnosticWriter {
     store: KvpPoolStore,
     agent: String,
     vm_id: String,
-    boot_epoch: i64,
 }
 
 impl DiagnosticReader {
@@ -422,7 +420,7 @@ impl DiagnosticReader {
 }
 
 impl DiagnosticWriter {
-    /// Fix the local producer identity and boot epoch used by every emitted record.
+    /// Fix the local producer identity used by every emitted record.
     /// The writer always emits `DIAG_V1`.
     pub fn new(store: KvpPoolStore, agent: impl Into<String>, vm_id: impl Into<String>) -> Result<Self, KvpError>;
 
@@ -460,8 +458,8 @@ Examples:
 # default dump: every physical record as JSON, including the report and a truncated dmesg group
 $ dump
 [
-  {"key":"DIAG_V1|azure-init-0.1.1|1700000000|vm-abc|finish|provision:run|9c1d...|2026-08-31T12:34:57.101Z|none|success|312|0","value":"provisioning succeeded"},
-  {"key":"DIAG_V1|azure-init-0.1.1|1700000000|vm-abc|event|dmesg|d4e5...|2026-07-27T21:33:25.00Z|gz+b64|||17","value":"<chunk 17; rest lost>"},
+  {"key":"DIAG_V1|azure-init-0.1.1|vm-abc|finish|provision:run|9c1d...|2026-08-31T12:34:57.101Z|none|success|312|0","value":"provisioning succeeded"},
+  {"key":"DIAG_V1|azure-init-0.1.1|vm-abc|event|dmesg|d4e5...|2026-07-27T21:33:25.00Z|gz+b64|||17","value":"<chunk 17; rest lost>"},
   {"key":"PROVISIONING_REPORT","value":"result=success|agent=azure-init-0.1.1|pps_type=None|vm_id=vm-abc|timestamp=2026-08-31T12:34:57.500Z"}
 ]
 
@@ -469,7 +467,7 @@ $ dump
 $ dump --parse
 [
   {"type":"diagnostic","kind":"finish","name":"provision:run","event_id":"9c1d...","timestamp":"2026-08-31T12:34:57.101Z","result":"success","duration":312,"payload":"provisioning succeeded"},
-  {"type":"raw","key":"DIAG_V1|azure-init-0.1.1|1700000000|vm-abc|event|dmesg|d4e5...|gz+b64|||17","value":"<chunk 17; rest lost>","error":"incomplete_group"},
+  {"type":"raw","key":"DIAG_V1|azure-init-0.1.1|vm-abc|event|dmesg|d4e5...|gz+b64|||17","value":"<chunk 17; rest lost>","error":"incomplete_group"},
   {"type":"PROVISIONING_REPORT","result":"success","agent":"azure-init-0.1.1","vm_id":"vm-abc","timestamp":"2026-08-31T12:34:57.500Z","pps_type":"None"}
 ]
 ```
@@ -498,7 +496,6 @@ The bridge maps fields onto the model:
 | Model field | cloud-init source |
 |---|---|
 | agent | the literal `CLOUD_INIT` |
-| boot_epoch | `incarnation` |
 | kind | `type` (`start`, `finish`, else `event`) |
 | name | `name` |
 | vm_id | present only on current keys |
@@ -507,6 +504,8 @@ The bridge maps fields onto the model:
 | result | value field on a finish, mapped to the model's `result` |
 | duration | value field on a finish (seconds; the bridge converts to milliseconds) |
 | encoding | the value `{encoding, data}` envelope, not the key |
+
+`incarnation` remains part of cloud-init's source key because that is the format cloud-init writes. The bridge includes it while grouping cloud-init chunks so records from different incarnations cannot combine, then discards it; it is not part of `DiagnosticKey`.
 
 cloud-init has no `DIAG_V1` field and the bridge does not invent one. Its `CLOUD_INIT` prefix selects the bridge, which performs its source-specific parsing before constructing the same version-independent `DiagnosticKey` as the `DIAG_V1` parser.
 
