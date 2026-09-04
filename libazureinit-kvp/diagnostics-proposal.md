@@ -89,24 +89,24 @@ The two disagree on field order, on where the timestamp and encoding live, and o
 
 ## Proposed design
 
-This proposal defines one versioned record format for azure-init and separate reader and writer interfaces over `KvpPoolStore`. The reader interprets the pool; the writer produces only the azure-init format. Untyped access remains on `KvpPoolStore` itself.
+This proposal defines one versioned diagnostic record format, emitted here by azure-init, and separate reader and writer interfaces over `KvpPoolStore`. The reader interprets the pool; the writer produces only this format. Untyped access remains on `KvpPoolStore` itself.
 
 ### Diagnostics format
 
 The proposed key is the current azure-init key with a few changes, all keeping metadata in the key. It is pipe-delimited with `|` reserved, begins with a diagnostic schema-version identifier, and always ends with the chunk index, so a single-record value still ends in `|0`:
 
 ```text
-AZURE_INIT_V1|<agent>|<boot_epoch>|<vm_id>|<kind>|<name>|<event_id>|<timestamp>|<encoding>|<result>|<duration>|<chunk_index>
+DIAG_V1|<agent>|<boot_epoch>|<vm_id>|<kind>|<name>|<event_id>|<timestamp>|<encoding>|<result>|<duration>|<chunk_index>
 ```
 
-- `AZURE_INIT_V1` is the `diagnostic_version_id`: `AZURE_INIT` identifies the diagnostics family and `V1` identifies version 1 of its wire schema. That schema covers the field layout, required and optional fields, token meanings, units, encoding rules, and chunk framing. It is one self-identifying token rather than a bare number because the pool also contains unrelated keys: a reader can recognize an unsupported future `AZURE_INIT_V*` record without mistaking an arbitrary numeric key for a diagnostic. It is separate from `agent`, which remains the producer identifier and whose version identifies the producer binary. A schema change requires a new `diagnostic_version_id`; an agent release by itself does not.
+- `DIAG_V1` is the `diagnostic_version_id`: `DIAG` identifies the general diagnostics family and `V1` identifies version 1 of its wire schema. It does not identify the producer; `agent` continues to do that. The schema covers the field layout, required and optional fields, token meanings, units, encoding rules, and chunk framing. It is one self-identifying token rather than a bare number because the pool also contains unrelated keys: a reader can recognize an unsupported future `DIAG_V*` record without mistaking an arbitrary numeric key for a diagnostic. A schema change requires a new `diagnostic_version_id`; an agent release by itself does not.
 - `type` becomes `kind`, narrowed to the three timeline positions (`start`/`finish`/`event`); any other category is carried by `name`, `encoding`, or `result`, not a token.
 - `encoding` names the payload encoding in the key so a large artifact can be compressed.
 - `result` and `duration` are the finish's verdict fields, carried in the key: `result` is a `success`/`fail` token and `duration` is the elapsed milliseconds. Both are required on a finish, optional on an event, and empty on a start. Everything else, including the plain-text value, is unchanged.
 
 | Field | Meaning |
 |---|---|
-| diagnostic_version_id | `AZURE_INIT_V1`; identifies the wire schema and selects its parser before any later field is interpreted |
+| diagnostic_version_id | `DIAG_V1`; identifies the wire schema and selects its parser before any later field is interpreted |
 | agent | Producer identifier, such as `azure-init-0.1.1` |
 | boot_epoch | Unix seconds of the boot that produced the record |
 | vm_id | VM identity |
@@ -114,20 +114,20 @@ AZURE_INIT_V1|<agent>|<boot_epoch>|<vm_id>|<kind>|<name>|<event_id>|<timestamp>|
 | name | Subject, such as `provision:run` or `dmesg` |
 | event_id | Shared by a span's start and finish, and by every chunk of one value |
 | timestamp | RFC 3339 (ISO 8601), UTC with a `Z` suffix, millisecond precision, e.g. `2026-08-31T12:34:56.789Z` |
-| encoding | How the value is encoded: `none`, `b64`, or `gz+b64` |
+| encoding | How the value is encoded: `none` or `gz+b64` |
 | result | `success` or `fail` on a finish, optionally on an event; empty otherwise |
 | duration | Elapsed milliseconds on a finish, optionally on a timed event; empty otherwise |
 | chunk_index | Chunk position, from 0 |
 
 #### Key size
 
-The whole key is one string, and the host silently truncates a guest-written key past 254 UTF-8 bytes; safe-mode `KvpPoolStore` rejects it first. The fixed fields spend most of that budget: `vm_id` and `event_id` at 36 bytes each plus the 24-byte `timestamp` are already 96 bytes, and `AZURE_INIT_V1` adds another 13 before the enums, numbers, and delimiters. A representative finish key runs about 190 bytes, leaving roughly 64 for the two free-form fields.
+The whole key is one string, and the host silently truncates a guest-written key past 254 UTF-8 bytes; safe-mode `KvpPoolStore` rejects it first. The fixed fields spend most of that budget: `vm_id` and `event_id` at 36 bytes each plus the 24-byte `timestamp` are already 96 bytes, and `DIAG_V1` adds another 7 before the enums, numbers, and delimiters. A representative finish key runs about 184 bytes, leaving roughly 70 for the two free-form fields.
 
 Only `agent` and `name` are free-form; every other field is bounded by its format or its enum. The writer caps the two so the whole key cannot exceed 254 bytes:
 
 | Field | Cap | Bounded by |
 |---|---|---|
-| diagnostic_version_id | 13 B | fixed `AZURE_INIT_V1` token |
+| diagnostic_version_id | 7 B | fixed `DIAG_V1` token |
 | agent | 32 B | free-form producer id |
 | name | 48 B | free-form subject |
 | vm_id, event_id | 36 B each | GUID / UUID |
@@ -136,7 +136,7 @@ Only `agent` and `name` are free-form; every other field is bounded by its forma
 | result, encoding, kind | ≤ 7 B each | enum token |
 | chunk_index | 4 B | at most 1023 records |
 
-With those caps the worst-case key is 243 bytes, leaving 11 bytes inside the limit. cloud-init reads are never capped; the bridge takes names as they are.
+With those caps the worst-case key is 237 bytes, leaving 17 bytes inside the limit. cloud-init reads are never capped; the bridge takes names as they are.
 
 ### Kinds
 
@@ -151,7 +151,7 @@ A `start` opens a span, an operation that takes measurable time such as `provisi
 It shares one `event_id` with its `finish`; that shared id is what ties the pair, so a `start` whose `finish` never arrives stands out as an operation that began but never ended, exactly the signal an operator wants after a hang or crash.
 
 ```text
-AZURE_INIT_V1|azure-init-0.1.1|1700000000|vm-abc|start|provision:run|9c1d2e3f-...|2026-08-31T12:34:56.789Z|none|||0   value: starting
+DIAG_V1|azure-init-0.1.1|1700000000|vm-abc|start|provision:run|9c1d2e3f-...|2026-08-31T12:34:56.789Z|none|||0   value: starting
 ```
 
 #### finish
@@ -159,7 +159,7 @@ AZURE_INIT_V1|azure-init-0.1.1|1700000000|vm-abc|start|provision:run|9c1d2e3f-..
 A `finish` closes the span it shares an `event_id` with. Its `timestamp` is later than the start's, and it reports the operation's outcome directly in the key: `result` is `success` or `fail`, and `duration` is the elapsed milliseconds. The writer holds the start instant, so it stamps `duration` at emit time rather than making a reader pair the two records to recover it, and a truncated pool that kept only the finish still carries both the verdict and the elapsed time. The value stays a human message such as `provisioning succeeded` or `provisioning failed: <reason>`. cloud-init carries the same fields in its value JSON, which the bridge maps across (see Compatibility).
 
 ```text
-AZURE_INIT_V1|azure-init-0.1.1|1700000000|vm-abc|finish|provision:run|9c1d2e3f-...|2026-08-31T12:34:57.101Z|none|success|312|0   value: provisioning succeeded
+DIAG_V1|azure-init-0.1.1|1700000000|vm-abc|finish|provision:run|9c1d2e3f-...|2026-08-31T12:34:57.101Z|none|success|312|0   value: provisioning succeeded
 ```
 
 #### event
@@ -170,32 +170,43 @@ Its value is the observed payload, read per `encoding`: a short text as `none`, 
 
 ```text
 # plain text, one record
-AZURE_INIT_V1|azure-init-0.1.1|1700000000|vm-abc|event|imds|8f3e...|2026-07-27T21:33:24.300Z|none|||0   value: Retrieved 1 key from IMDS
+DIAG_V1|azure-init-0.1.1|1700000000|vm-abc|event|imds|8f3e...|2026-07-27T21:33:24.300Z|none|||0   value: Retrieved 1 key from IMDS
 
 # an event that is itself a failure sets result
-AZURE_INIT_V1|azure-init-0.1.1|1700000000|vm-abc|event|imds|7b2c...|2026-07-27T21:33:24.400Z|none|fail||0   value: IMDS unreachable
+DIAG_V1|azure-init-0.1.1|1700000000|vm-abc|event|imds|7b2c...|2026-07-27T21:33:24.400Z|none|fail||0   value: IMDS unreachable
 
 # a self-contained timing sets duration but no result
-AZURE_INIT_V1|azure-init-0.1.1|1700000000|vm-abc|event|imds:probe|5d6e...|2026-07-27T21:33:24.500Z|none||52|0   value: probed IMDS in 52ms
+DIAG_V1|azure-init-0.1.1|1700000000|vm-abc|event|imds:probe|5d6e...|2026-07-27T21:33:24.500Z|none||52|0   value: probed IMDS in 52ms
 
 # compressed artifact, split across records, indices 0..N
-AZURE_INIT_V1|azure-init-0.1.1|1700000000|vm-abc|event|dmesg|9a1b...|<ts>|gz+b64|||0   value: <base64 of gzip, chunk 0>
-AZURE_INIT_V1|azure-init-0.1.1|1700000000|vm-abc|event|dmesg|9a1b...|<ts>|gz+b64|||1   value: <chunk 1>
+DIAG_V1|azure-init-0.1.1|1700000000|vm-abc|event|dmesg|9a1b...|<ts>|gz+b64|||0   value: <base64 of gzip, chunk 0>
+DIAG_V1|azure-init-0.1.1|1700000000|vm-abc|event|dmesg|9a1b...|<ts>|gz+b64|||1   value: <chunk 1>
 ```
+
+### Payloads
+
+The public API distinguishes text from arbitrary bytes instead of representing every decoded payload as `Vec<u8>`. `DiagnosticPayload::Text` carries a Rust `String`, which is already valid UTF-8; `DiagnosticPayload::Bytes` carries arbitrary bytes. Writer methods accept `impl Into<DiagnosticPayload>`, with conversions from `&str`, `String`, `&[u8]`, and `Vec<u8>`, so callers can pass either form without separate method names.
+
+The caller still chooses the wire `encoding`; the input type does not guess whether compression is useful. The writer handles each combination as follows:
+
+| Input | `encoding=None` | `gz+b64` |
+|---|---|---|
+| Text | Store its UTF-8 bytes directly | Encode its UTF-8 bytes |
+| Bytes | Validate UTF-8, then store directly; reject invalid UTF-8 | Encode the arbitrary bytes |
+
+On read, `none` must decode as UTF-8 and produces `DiagnosticPayload::Text`; invalid UTF-8 is `Undecodable`. `gz+b64` produces `DiagnosticPayload::Bytes` after decoding, even when those bytes happen to be valid UTF-8, because the wire schema does not declare their content type.
+
+In JSON output, `Text` is a JSON string. `Bytes` is `{ "type": "bytes", "encoding": "base64", "data": "..." }`, because JSON cannot carry arbitrary bytes; this presentation encoding does not change the diagnostic's wire `encoding`.
 
 ### Encodings
 
-`encoding` names how the value bytes are formed, chosen by the caller when it emits a diagnostic rather than guessed from size, so the choice is deterministic. It lives in the key so a reader knows it without parsing the value, and the value stays a single opaque payload rather than a wrapper. base64 is required for any binary, because the store holds values as UTF-8 and trims trailing nulls, so raw bytes would not survive a round trip. Because the encoding is a key token, a new one can be added later without a format change; cloud-init instead declares its encoding inside the value (see Compatibility).
+`encoding` names how the payload is represented in the KVP value, chosen by the caller when it emits a diagnostic rather than guessed from size, so the choice is deterministic. It lives in the key so a reader knows it without parsing the value, and the value stays a single opaque payload rather than a wrapper. Arbitrary binary uses `gz+b64` because the store holds values as UTF-8 and trims trailing nulls, so raw bytes would not survive a round trip. `DIAG_V1` does not define standalone base64; a later schema can add another encoding without changing the key's overall shape. cloud-init instead declares its encoding inside the value (see Compatibility).
 
 Whatever the encoding, a value over the 1022-byte limit is split across chunks that share the value's `event_id` and `kind` and are ordered by `chunk_index`; decoding joins them in order before anything else.
 
 #### none
 
 Plain UTF-8 text, the default and the common case. The value is the message as stored, so decoding is a no-op; a split value is just the text slices joined in index order. Span messages and short observations use `none`.
-
-#### b64
-
-Standard base64 of the raw payload bytes, for binary that will not shrink usefully. Decoding joins the chunks and base64-decodes them back to the original bytes. The key stays text and the binary survives the UTF-8 store.
 
 #### gz+b64
 
@@ -219,11 +230,11 @@ Diagnostics pool
    └─ chunk 0
 ```
 
-`DiagnosticReader::entries()` reads the pool once and interprets every record, returning one `Entry` each: it combines and decodes a diagnostic into a `Diagnostic`, parses the `PROVISIONING_REPORT` into a `ProvisioningReport`, and leaves anything else as `Raw` (its key and value). A recognized record that will not parse — a broken diagnostic group, an unsupported azure-init diagnostics version, or a malformed report — also falls back to `Raw`, carrying the `DecodeError`, so nothing is dropped. A caller that wants the untouched records reads `KvpPoolStore` directly.
+`DiagnosticReader::entries()` reads the pool once and interprets every record, returning one `Entry` each: it combines and decodes a diagnostic into a `Diagnostic`, parses the `PROVISIONING_REPORT` into a `ProvisioningReport`, and leaves anything else as `Raw` (its key and value). A recognized record that will not parse — a broken diagnostic group, an unsupported diagnostics version, or a malformed report — also falls back to `Raw`, carrying the `DecodeError`, so nothing is dropped. A caller that wants the untouched records reads `KvpPoolStore` directly.
 
-Writing is the inverse: `DiagnosticWriter` stamps `AZURE_INIT_V1`, frames a diagnostic into records, and appends them to the `KvpPoolStore`.
+Writing is the inverse: `DiagnosticWriter` stamps `DIAG_V1`, converts the typed payload according to `encoding`, frames it into records, and appends them to the `KvpPoolStore`.
 
-Reading the pool like a log is the `Diagnostic` entries in timestamp order. The host may reorder the pool, so a reader sorts on the timestamp each carries, and each becomes one line:
+Reading the pool like a log is the `Diagnostic` entries in timestamp order. The host may reorder the pool, so a reader sorts on the timestamp each carries. Text output renders each as one line:
 
 ```text
 2026-08-31T12:34:56.789Z  start   provision:run
@@ -247,17 +258,15 @@ flowchart TD
   client["Provisioning client"] --> new["DiagnosticWriter::new<br/>store, agent, vm_id"]
   new --> init{"identity valid and<br/>boot epoch readable?"}
   init -->|"no"| initerr["Err(KvpError)<br/>writer not constructed"]
-  init -->|"yes"| emit["DiagnosticWriter::emit_*<br/>kind, name, payload"]
-  emit --> valid{"fields, kind invariants,<br/>and encoding valid?"}
+  init -->|"yes"| emit["DiagnosticWriter::emit_*<br/>text or byte payload"]
+  emit --> valid{"fields, kind invariants,<br/>payload, and encoding valid?"}
   valid -->|"no"| inputerr["Err(KvpError)<br/>nothing written"]
   valid -->|"yes"| encsel{"encoding<br/>(caller's choice)"}
   encsel -->|"gz+b64"| gz["gzip then base64"]
-  encsel -->|"b64"| b64["base64"]
   encsel -->|"none"| plain["text as-is"]
   gz --> frame["frame on UTF-8 boundaries<br/>1022-byte value cap"]
-  b64 --> frame
   plain --> frame
-  frame --> keys["stamp AZURE_INIT_V1<br/>and format chunk keys"]
+  frame --> keys["stamp DIAG_V1<br/>and format chunk keys"]
   keys --> limits{"key and chunk-count<br/>limits satisfied?"}
   limits -->|"no"| inputerr
   limits -->|"yes"| append["KvpPoolStore::append_multiple<br/>all chunks under one lock"]
@@ -275,8 +284,8 @@ flowchart TD
   entries --> dump["KvpPoolStore::dump()"]
   dump -->|"lock / read error"| readerr["Err(KvpError)<br/>no entries returned"]
   dump -->|"ok"| cls{"first key field"}
-  cls -->|"AZURE_INIT_V1"| dec["source parser<br/>parse, group, decode"]
-  cls -->|"unsupported AZURE_INIT_V*"| rawver["Entry::Raw<br/>UnsupportedVersion"]
+  cls -->|"DIAG_V1"| dec["source parser<br/>parse, group, decode"]
+  cls -->|"unsupported DIAG_V*"| rawver["Entry::Raw<br/>UnsupportedVersion"]
   cls -->|"CLOUD_INIT"| bridge["cloud-init bridge"]
   bridge --> dec
   cls -->|"PROVISIONING_REPORT"| rep["parse report"]
@@ -300,31 +309,39 @@ flowchart TD
 
 `KvpError` and `DecodeError` mark different boundaries. A `KvpError` means the requested construction, read, or write could not complete and is returned by the method. A `DecodeError` means the pool read succeeded but stored data could not be interpreted; `entries()` still succeeds and preserves that data as `Entry::Raw` with the reason.
 
-The writer prepares and validates the complete batch before calling the store, so an identity, field, encoding, or size error writes nothing. Once `append_multiple` begins, a lock, write, or flush error returns `KvpError` but may leave part of the batch in the pool. A reader reports a visible index gap as `IncompleteGroup` and invalid encoded content as `Undecodable`. A contiguous prefix of a `none` payload has neither condition and cannot be distinguished from a complete value because this format carries no total chunk count.
+The writer prepares and validates the complete batch before calling the store, so an identity, field, payload, encoding, or size error writes nothing. This includes byte input that is not valid UTF-8 when `encoding=None`. Once `append_multiple` begins, a lock, write, or flush error returns `KvpError` but may leave part of the batch in the pool. A reader reports a visible index gap as `IncompleteGroup` and invalid encoded content as `Undecodable`. A contiguous prefix of a `none` payload has neither condition and cannot be distinguished from a complete value because this format carries no total chunk count.
 
-The `diagnostic_version_id` is part of every azure-init group key, so chunks from different schemas can never combine. The rest of the group key includes `kind` because a span's start and finish share an `event_id`. There is no decode-time size limit either: the producer is trusted and the pool bounds the input, so an artifact either fits when it is written or is never written.
+The `diagnostic_version_id` is part of every diagnostic group key, so chunks from different schemas can never combine. The rest of the group key includes `kind` because a span's start and finish share an `event_id`. There is no decode-time size limit either: the producer is trusted and the pool bounds the input, so an artifact either fits when it is written or is never written.
 
 ## Crate design
 
-The crate exposes two interfaces over `KvpPoolStore`; neither holds files or locks, and both delegate all IO to the store. `DiagnosticWriter` is the provisioning clients' producer interface: clients provide diagnostic meaning and payload, but do not construct keys, frame chunks, or append diagnostic records directly. A diagnostic consumer reads through `DiagnosticReader`; a caller that wants untyped records uses the store directly. The writer produces azure-init records only. The reader understands supported azure-init versions and reads cloud-init through the bridge. The format and behavior are in Proposed design; the types, API, and CLI are here.
+The crate exposes two interfaces over `KvpPoolStore`; neither holds files or locks, and both delegate all IO to the store. `DiagnosticWriter` is the provisioning clients' producer interface: clients provide diagnostic meaning and payload, but do not construct keys, frame chunks, or append diagnostic records directly. A diagnostic consumer reads through `DiagnosticReader`; a caller that wants untyped records uses the store directly. The writer produces azure-init records only. The reader understands supported diagnostics versions and reads cloud-init through the bridge. The format and behavior are in Proposed design; the types, API, and CLI are here.
 
-Their initialization is deliberately asymmetric. `DiagnosticReader` needs only a store because every source, identity, boot, and format decision comes from the records it reads; constructing one performs no IO. `DiagnosticWriter` needs the store plus the local `agent` and `vm_id`, validates that stable producer identity once, and obtains the boot epoch once for every record it will emit. It always writes the crate's current `AZURE_INIT_V1` format; callers cannot select a version or ask it to write cloud-init records. A process that needs both interfaces constructs them from clones of the same `KvpPoolStore`.
+Their initialization is deliberately asymmetric. `DiagnosticReader` needs only a store because every source, identity, boot, and format decision comes from the records it reads; constructing one performs no IO. `DiagnosticWriter` needs the store plus the local `agent` and `vm_id`, validates that stable producer identity once, and obtains the boot epoch once for every record it will emit. It always writes the crate's current `DIAG_V1` format; callers cannot select a version or ask it to write cloud-init records. A process that needs both interfaces constructs them from clones of the same `KvpPoolStore`.
 
 ```rust
-const AZURE_INIT_DIAGNOSTIC_VERSION_ID: &str = "AZURE_INIT_V1";
+const DIAGNOSTIC_VERSION_ID: &str = "DIAG_V1";
 
 enum Kind { Start, Finish, Event }
 
-/// Plain text is `None`; a value names an encoding only when it has one.
+/// Plain text is `None`; a compressed value is `GzB64`.
 /// `Other` keeps an unknown token so it decodes to `Undecodable`, never a panic.
-enum Encoding { B64, GzB64, Other(String) }
+enum Encoding { GzB64, Other(String) }
 
 enum Outcome { Success, Failure }
+
+/// The decoded payload. Rust strings guarantee UTF-8; bytes make no text claim.
+/// `From` implementations map `&str` and `String` to `Text`, and `&[u8]`
+/// and `Vec<u8>` to `Bytes`.
+enum DiagnosticPayload {
+    Text(String),
+    Bytes(Vec<u8>),
+}
 
 /// Why a recognized record could not be parsed, carried by the `Raw` it falls back to.
 /// Implements `Error`, serialized as a snake_case reason.
 enum DecodeError {
-    /// The key identifies the azure-init diagnostics family, but not a version this reader supports.
+    /// The key identifies the diagnostics family, but not a version this reader supports.
     UnsupportedVersion,
     /// Chunks are missing: not a contiguous run from 0.
     IncompleteGroup,
@@ -352,11 +369,11 @@ struct DiagnosticKey {
 }
 
 /// Opens a span.
-struct DiagnosticStart  { key: DiagnosticKey, payload: Vec<u8> }
+struct DiagnosticStart  { key: DiagnosticKey, payload: DiagnosticPayload }
 /// Closes a span; carries its verdict and elapsed milliseconds.
-struct DiagnosticFinish { key: DiagnosticKey, payload: Vec<u8>, result: Outcome, duration_ms: u64 }
+struct DiagnosticFinish { key: DiagnosticKey, payload: DiagnosticPayload, result: Outcome, duration_ms: u64 }
 /// A point observation; may carry a verdict or a self-contained timing.
-struct DiagnosticEvent  { key: DiagnosticKey, payload: Vec<u8>, result: Option<Outcome>, duration_ms: Option<u64> }
+struct DiagnosticEvent  { key: DiagnosticKey, payload: DiagnosticPayload, result: Option<Outcome>, duration_ms: Option<u64> }
 
 /// One decoded emission, typed by kind.
 enum Diagnostic {
@@ -406,58 +423,66 @@ impl DiagnosticReader {
 
 impl DiagnosticWriter {
     /// Fix the local producer identity and boot epoch used by every emitted record.
-    /// The writer always emits `AZURE_INIT_V1`.
+    /// The writer always emits `DIAG_V1`.
     pub fn new(store: KvpPoolStore, agent: impl Into<String>, vm_id: impl Into<String>) -> Result<Self, KvpError>;
 
     /// Open a span. `event_id` links this start to the finish that closes it.
-    pub fn emit_start(&self, event_id: &str, name: &str, payload: &[u8], encoding: Option<Encoding>) -> Result<(), KvpError>;
+    pub fn emit_start(&self, event_id: &str, name: &str, payload: impl Into<DiagnosticPayload>, encoding: Option<Encoding>) -> Result<(), KvpError>;
 
     /// Close the span opened under `event_id`, recording its `result` and elapsed `duration_ms`.
-    pub fn emit_finish(&self, event_id: &str, name: &str, payload: &[u8], encoding: Option<Encoding>, result: Outcome, duration_ms: u64) -> Result<(), KvpError>;
+    pub fn emit_finish(&self, event_id: &str, name: &str, payload: impl Into<DiagnosticPayload>, encoding: Option<Encoding>, result: Outcome, duration_ms: u64) -> Result<(), KvpError>;
 
     /// Record a standalone point observation; the writer assigns its `event_id`.
     /// `result` and `duration_ms` are set only when measured.
-    pub fn emit_event(&self, name: &str, payload: &[u8], encoding: Option<Encoding>, result: Option<Outcome>, duration_ms: Option<u64>) -> Result<(), KvpError>;
+    pub fn emit_event(&self, name: &str, payload: impl Into<DiagnosticPayload>, encoding: Option<Encoding>, result: Option<Outcome>, duration_ms: Option<u64>) -> Result<(), KvpError>;
 }
 ```
 
 ### CLI
 
-`dump` prints every record in pool order as raw `KEY=VALUE`. `--parse` is an add-on: it interprets each record, decoding diagnostics and parsing the `PROVISIONING_REPORT` into a `ProvisioningReport`, and leaves anything it does not recognize as its raw key and value. Nothing is dropped.
+JSON is the default output mode for `dump`; `--json` may state it explicitly, and the mutually exclusive `--text` selects human-readable output. `dump` returns every physical record in pool order as a JSON array of `{ "key", "value" }` objects. `--parse` changes what is represented, not the output mode: it decodes diagnostics, parses the `PROVISIONING_REPORT`, and leaves anything it does not recognize as `Raw`. Nothing is dropped.
 
 ```text
-dump           -> every record, raw KEY=VALUE
-dump --parse   -> known records parsed (Diagnostic, ProvisioningReport); the rest stay Raw
+dump                    -> JSON array of every physical {key, value} record
+dump --parse            -> JSON array of Diagnostic, ProvisioningReport, and Raw entries
+dump --text             -> every physical record as raw KEY=VALUE
+dump --parse --text     -> one human-readable line per interpreted entry
 ```
 
-- `--parse` calls `DiagnosticReader::entries()`, one `Entry` per item. A recognized record that will not parse — a broken diagnostic, an unsupported azure-init diagnostics version, or a malformed report — stays `Raw` with its `DecodeError`, so its key, value, and the reason are all shown.
+- `--parse` calls `DiagnosticReader::entries()`, one `Entry` per item. A recognized record that will not parse — a broken diagnostic, an unsupported diagnostics version, or a malformed report — stays `Raw` with its `DecodeError`, so its key, value, and the reason are all shown.
 - `--name` filters the parsed diagnostics by name; other entries are unaffected.
+- `--json` and `--text` are mutually exclusive; omitting both is equivalent to `--json`.
+- In parsed text output, `Text` payloads print directly and `Bytes` payloads print as standard base64 under `payload_b64`.
 
 Examples:
 
 ```text
-# dump: every record raw, including the report and a dmesg chunk whose group was truncated
+# default dump: every physical record as JSON, including the report and a truncated dmesg group
 $ dump
-AZURE_INIT_V1|azure-init-0.1.1|1700000000|vm-abc|finish|provision:run|9c1d...|2026-08-31T12:34:57.101Z|none|success|312|0=provisioning succeeded
-AZURE_INIT_V1|azure-init-0.1.1|1700000000|vm-abc|event|dmesg|d4e5...|2026-07-27T21:33:25.00Z|gz+b64|||17=<chunk 17; rest lost>
-PROVISIONING_REPORT=result=success|agent=azure-init-0.1.1|pps_type=None|vm_id=vm-abc|timestamp=2026-08-31T12:34:57.500Z
+[
+  {"key":"DIAG_V1|azure-init-0.1.1|1700000000|vm-abc|finish|provision:run|9c1d...|2026-08-31T12:34:57.101Z|none|success|312|0","value":"provisioning succeeded"},
+  {"key":"DIAG_V1|azure-init-0.1.1|1700000000|vm-abc|event|dmesg|d4e5...|2026-07-27T21:33:25.00Z|gz+b64|||17","value":"<chunk 17; rest lost>"},
+  {"key":"PROVISIONING_REPORT","value":"result=success|agent=azure-init-0.1.1|pps_type=None|vm_id=vm-abc|timestamp=2026-08-31T12:34:57.500Z"}
+]
 
-# --parse: the diagnostic decodes, the report parses, the unassemblable dmesg chunk stays raw with its reason
+# --parse remains JSON: the diagnostic decodes, the report parses, and the dmesg chunk stays Raw
 $ dump --parse
-{"type":"diagnostic","kind":"finish","name":"provision:run","event_id":"9c1d...","timestamp":"2026-08-31T12:34:57.101Z","result":"success","duration":312,"payload":"provisioning succeeded"}
-{"type":"raw","key":"AZURE_INIT_V1|azure-init-0.1.1|1700000000|vm-abc|event|dmesg|d4e5...|gz+b64|||17","value":"<chunk 17; rest lost>","error":"incomplete_group"}
-{"type":"PROVISIONING_REPORT","result":"success","agent":"azure-init-0.1.1","vm_id":"vm-abc","timestamp":"2026-08-31T12:34:57.500Z","pps_type":"None"}
+[
+  {"type":"diagnostic","kind":"finish","name":"provision:run","event_id":"9c1d...","timestamp":"2026-08-31T12:34:57.101Z","result":"success","duration":312,"payload":"provisioning succeeded"},
+  {"type":"raw","key":"DIAG_V1|azure-init-0.1.1|1700000000|vm-abc|event|dmesg|d4e5...|gz+b64|||17","value":"<chunk 17; rest lost>","error":"incomplete_group"},
+  {"type":"PROVISIONING_REPORT","result":"success","agent":"azure-init-0.1.1","vm_id":"vm-abc","timestamp":"2026-08-31T12:34:57.500Z","pps_type":"None"}
+]
 ```
 
 ## Adoption
 
-azure-init adopts `AZURE_INIT_V1` by cutting over to it when it switches to the kvp crate; this is the first supported azure-init diagnostics format. The unversioned azure-init shape under Records today is pre-adoption rather than a compatibility contract: `DiagnosticReader` leaves one of those records as `Raw` instead of guessing which schema it follows. There are no prior records to migrate.
+azure-init adopts `DIAG_V1` by cutting over to it when it switches to the kvp crate; this is the first supported diagnostics schema. The unversioned azure-init shape under Records today is pre-adoption rather than a compatibility contract: `DiagnosticReader` leaves one of those records as `Raw` instead of guessing which schema it follows. There are no prior records to migrate.
 
 Updating cloud-init to emit this format is a non-goal for now and may be revisited; until then cloud-init is read-only through the compatibility bridge.
 
 ## Compatibility
 
-cloud-init writes diagnostics into the same pool in its own format. `DiagnosticReader` dispatches its records to a read-only bridge that maps them onto the same model; `DiagnosticWriter` never writes cloud-init's format, and the `AZURE_INIT_V1` parser never parses a cloud-init value.
+cloud-init writes diagnostics into the same pool in its own format. `DiagnosticReader` dispatches its records to a read-only bridge that maps them onto the same model; `DiagnosticWriter` never writes cloud-init's format, and the `DIAG_V1` parser never parses a cloud-init value.
 
 cloud-init keys put the type and name before the identifiers, and current keys include a `vm_id` that older keys omit:
 
@@ -483,6 +508,6 @@ The bridge maps fields onto the model:
 | duration | value field on a finish (seconds; the bridge converts to milliseconds) |
 | encoding | the value `{encoding, data}` envelope, not the key |
 
-cloud-init has no `AZURE_INIT_V1` field and the bridge does not invent one. Its `CLOUD_INIT` prefix selects the bridge, which performs its source-specific parsing before constructing the same version-independent `DiagnosticKey` as the azure-init parser.
+cloud-init has no `DIAG_V1` field and the bridge does not invent one. Its `CLOUD_INIT` prefix selects the bridge, which performs its source-specific parsing before constructing the same version-independent `DiagnosticKey` as the `DIAG_V1` parser.
 
-Reassembly is cloud-init specific: chunks are JSON objects, so the bridge validates each `msg_i` against the chunk index, concatenates the still-escaped `msg` slices, and unescapes the joined string once. If the result is an `{encoding, data}` envelope, the bridge decodes it with the same encodings as the core; otherwise the message is the payload. cloud-init declares its encoding in the value, which is why it is read there and not from the key.
+Reassembly is cloud-init specific: chunks are JSON objects, so the bridge validates each `msg_i` against the chunk index, concatenates the still-escaped `msg` slices, and unescapes the joined string once. If the result is an `{encoding, data}` envelope, the bridge decodes it with the same encodings as the core into `DiagnosticPayload::Bytes`; otherwise the message becomes `DiagnosticPayload::Text`. cloud-init declares its encoding in the value, which is why it is read there and not from the key.
