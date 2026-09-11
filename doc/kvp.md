@@ -239,3 +239,50 @@ no truncation.
 | `HV_KVP_EXCHANGE_MAX_RECORDS` | 1,024 | Max records per pool file |
 | `HV_KVP_SAFE_MAX_UTF8_KEY_SIZE` | 255 | 254 UTF-8 bytes + null-terminator; no kernel truncation on write path |
 | `HV_KVP_SAFE_MAX_UTF8_VALUE_SIZE` | 1,023 | 1,022 UTF-8 bytes + null-terminator; no kernel truncation on write path |
+
+---
+
+## Diagnostics API and CLI
+
+`libazureinit-kvp` exports `DiagnosticWriter` for `DIAG_V1` records and
+`DiagnosticReader` for diagnostics, provisioning reports, and raw records.
+The writer validates the agent identifier and VM UUID at construction.
+`emit_start` and `emit_finish` share a caller-supplied event UUID;
+`emit_event` generates its own. Durations are integer milliseconds.
+Payloads are plain UTF-8 text or gzip plus base64 (`Encoding::GzB64`).
+
+Each reader call takes one fresh snapshot and returns `Entry::Diagnostic`,
+`Entry::Report`, or `Entry::Raw` in first-seen pool order. Unknown records
+remain raw; recognized but invalid records also carry a `DecodeError`.
+Cloud-init records are supported through a read-only compatibility bridge.
+Invalid physical UTF-8 fails the entire snapshot without partial output.
+Neither reading nor emitting diagnostics clears stale pool data implicitly.
+
+| Command | Output |
+|---------|--------|
+| `libazureinit-kvp dump` | JSON array of physical key/value records in pool order, including duplicates |
+| `libazureinit-kvp dump --parse` | JSON array of diagnostics and reports in timestamp order, then raw entries |
+| `libazureinit-kvp dump --text` | Physical records as `KEY=VALUE` lines |
+| `libazureinit-kvp dump --parse --text` | The same timestamp ordering, with binary payloads under `payload_b64` |
+| `libazureinit-kvp dump --parse --name ssh` | Filter diagnostic names by substring; retain reports and raw entries |
+
+Parsed CLI output is oldest-first. Equal timestamps keep first-seen order;
+raw entries retain their relative pool order at the end. This presentation
+does not change `DiagnosticReader::entries()` or the pool file.
+
+`--json` and `--text` are mutually exclusive. Only `dump` defaults to JSON;
+other commands retain their text defaults. Global `--dir` and `--pool`
+options select the store.
+
+```sh
+libazureinit-kvp emit --agent azure-init \
+  --vm-id 3f2504e0-4f89-41d3-9a0c-0305e82c3301 \
+  --name user:create_user --message "created azureuser"
+```
+
+The separate reader and writer replace `DiagnosticsKvp`. `--parse` replaces
+`--parse-diagnostics`, and `emit --agent` replaces `--prefix`. The `--tail`
+and `-n` options are removed.
+
+See the [diagnostics specification](../libazureinit-kvp/diagnostics-proposal.md)
+for the wire format, validation limits, and cloud-init compatibility rules.

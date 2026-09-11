@@ -9,8 +9,40 @@
 //! - [`ProvisioningReport`]: structured provisioning health report that
 //!   is persisted as the single `PROVISIONING_REPORT` record with
 //!   [`write_report`].
-//! - [`DiagnosticsKvp`]: typed writer for azure-init diagnostics and normalized
-//!   reader for azure-init and cloud-init entries.
+//! - [`DiagnosticWriter`]: typed writer for versioned diagnostics.
+//! - [`DiagnosticReader`]: reader for diagnostics, provisioning reports, and
+//!   raw records, including a read-only cloud-init compatibility bridge.
+//!
+//! # Diagnostics
+//!
+//! The reader preserves first-seen pool order. Unknown or invalid records
+//! remain [`Entry::Raw`] within a successful snapshot; a failed snapshot,
+//! including invalid physical UTF-8, returns an error without entries.
+//! The CLI's `dump --parse` sorts diagnostics and reports by timestamp,
+//! oldest first, with stable ties and raw entries last.
+//!
+//! ```no_run
+//! use libazureinit_kvp::{
+//!     DiagnosticReader, DiagnosticWriter, KvpPool, KvpPoolStore, Outcome,
+//!     PoolMode,
+//! };
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let store = KvpPoolStore::new(KvpPool::Guest, PoolMode::Safe)?;
+//! let writer = DiagnosticWriter::new(
+//!     store.clone(),
+//!     "azure-init",
+//!     "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+//! )?;
+//! writer.emit_event(
+//!     "imds", "metadata retrieved", None, Some(Outcome::Success), None,
+//! )?;
+//!
+//! let entries = DiagnosticReader::new(store).entries()?;
+//! println!("{}", serde_json::to_string(&entries)?);
+//! # Ok(())
+//! # }
+//! ```
 
 mod cli;
 mod diagnostics;
@@ -21,7 +53,10 @@ mod vm_id;
 
 pub use cli::run;
 pub use diagnostics::{
-    DiagnosticEvent, DiagnosticKind, DiagnosticsKvp, MAX_CHUNK_BYTES,
+    DecodeError, Diagnostic, DiagnosticEvent, DiagnosticFinish, DiagnosticKey,
+    DiagnosticPayload, DiagnosticReader, DiagnosticStart, DiagnosticWriter,
+    Encoding, Entry, Kind, Outcome, RawKeyValue, DIAGNOSTIC_VERSION_ID,
+    MAX_CHUNK_BYTES,
 };
 pub use error::KvpError;
 pub use report::{

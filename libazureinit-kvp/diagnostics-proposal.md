@@ -134,6 +134,8 @@ The host silently truncates keys past 254 UTF-8 bytes; safe-mode `KvpPoolStore` 
 
 With those caps the worst-case key is 226 bytes, leaving 28 bytes inside the limit. cloud-init reads are never capped; the bridge takes names as they are.
 
+Wire examples with shortened UUIDs or `<ts>` are schematic. Stored `DIAG_V1` records require valid UUIDs and the exact timestamp format above.
+
 ### Kinds
 
 `kind` marks timeline position only: `start` opens an operation, `finish` closes one, and `event` is a one-off. These cover every timeline position. Other categories belong in `encoding`, `name`, or `result`; values are messages or artifacts, not kind-specific structures. For cloud-init, `compressed` maps to encoding and `system-info` to name (see Compatibility).
@@ -184,7 +186,9 @@ The caller chooses the wire `encoding`; the input type does not infer whether co
 | Text | Store its UTF-8 bytes directly | Encode its UTF-8 bytes |
 | Bytes | Validate UTF-8, then store directly; reject invalid UTF-8 | Encode the arbitrary bytes |
 
-On read, `none` produces `Text` after UTF-8 validation; invalid UTF-8 is `Undecodable`. `gz+b64` produces `Bytes` even when the decoded bytes are valid UTF-8, because the wire does not declare their content type.
+On read, `KvpPoolStore::dump()` validates the physical keys and values as UTF-8 before diagnostic parsing. Invalid UTF-8 in any field before its terminating NUL fails the entire snapshot with `KvpError::Io` carrying `InvalidData`; no entries are returned. Record preservation applies only to a successful string-based snapshot, not to arbitrary physical bytes.
+
+Within a successful snapshot, `none` produces `Text`. `gz+b64` produces `Bytes` even when the decoded bytes are valid UTF-8, because the wire does not declare their content type. Its stored base64 is UTF-8 text, so arbitrary decoded bytes do not violate the store contract. Invalid base64 or gzip remains `Undecodable` and falls back to `Raw`.
 
 JSON renders `Text` as a string and `Bytes` as `{ "type": "bytes", "encoding": "base64", "data": "..." }`; this presentation does not change the wire `encoding`.
 
@@ -220,11 +224,15 @@ Diagnostics pool
    └─ chunk 0
 ```
 
-`DiagnosticReader::entries()` reads the pool once and returns each logical item as a decoded `Diagnostic`, parsed `ProvisioningReport`, or `Raw` key and value. Unrecognized records are `Raw`; recognized but invalid records are `Raw` with a `DecodeError`, so nothing is dropped. `KvpPoolStore` provides the untouched physical view.
+`DiagnosticReader::entries()` reads the pool once through `KvpPoolStore::dump()`. If that snapshot succeeds, each logical item becomes a decoded `Diagnostic`, parsed `ProvisioningReport`, or `Raw` key and value. Unrecognized records are `Raw`; recognized but invalid records are `Raw` with a `DecodeError`, so no record from the successful snapshot is dropped. `KvpPoolStore::dump()` exposes the physical key/value records as UTF-8 strings without diagnostic interpretation.
+
+Any snapshot failure, including invalid physical UTF-8 or malformed physical record framing, returns `KvpError` with no entries, even when other records are valid. Reads do not modify the pool; they neither skip unreadable records nor replace invalid bytes with lossy text. The existing string-based store and `RawKeyValue` interfaces remain unchanged.
+
+Only the exact `PROVISIONING_REPORT` key selects report parsing. Its value is one pipe-delimited CSV record of `key=value` fields, with double-quote escaping for embedded pipes, quotes, or newlines. `result` (`success` or `error`), `agent`, `vm_id`, `pps_type`, and an RFC 3339 `timestamp` are required; error reports also require `reason` and may include `documentation_url`. Field order is not significant. Empty text values remain supported, and identities and timestamps are preserved rather than normalized. Other fields remain ordered supporting data, including duplicate supporting-data keys. Duplicate standard fields, unknown enum tokens, missing required fields, or malformed CSV are `Raw` with `Malformed`, not silently repaired or interpreted with first/last-write-wins semantics.
 
 Writing is the inverse: `DiagnosticWriter` stamps `DIAG_V1`, converts the typed payload according to `encoding`, frames it into records, and appends them to the `KvpPoolStore`.
 
-The reader sorts diagnostics by timestamp because the host may reorder the pool. Text output renders one line per diagnostic:
+The reader preserves first-seen pool order: a complete chunk group occupies its first physical position, and failed groups remain raw records at their original positions. Only the CLI's `dump --parse` sorts diagnostics and reports by timestamp, oldest first, with stable ties and raw entries last. A span's timeline can be summarized as:
 
 ```text
 2026-08-31T12:34:56.789Z  start   provision:run
@@ -272,7 +280,7 @@ flowchart TD
   client["Diagnostic consumer / CLI"] --> new["DiagnosticReader::new(store)<br/>no IO, cannot fail"]
   new --> entries["DiagnosticReader::entries()"]
   entries --> dump["KvpPoolStore::dump()"]
-  dump -->|"lock / read error"| readerr["Err(KvpError)<br/>no entries returned"]
+  dump -->|"lock / read / framing / UTF-8 error"| readerr["Err(KvpError)<br/>no entries returned"]
   dump -->|"ok"| cls{"first key field"}
   cls -->|"DIAG_V1"| dec["source parser<br/>parse, group, decode"]
   cls -->|"unsupported DIAG_V*"| rawver["Entry::Raw<br/>UnsupportedVersion"]
@@ -297,11 +305,11 @@ flowchart TD
   repe --> out
 ```
 
-`KvpError` means construction, reading, or writing failed and is returned by the method. `DecodeError` describes uninterpretable stored data; `entries()` still succeeds and preserves it as `Entry::Raw`.
+`KvpError` means construction, reading, or writing failed and is returned by the method; snapshot failures include invalid physical UTF-8. `DecodeError` describes uninterpretable records within a successful string-based snapshot; `entries()` still succeeds and preserves those records as `Entry::Raw`.
 
 The writer validates the full batch before storage, so identity, field, payload, encoding, and size errors write nothing; this includes non-UTF-8 bytes with `encoding=None`. Once `append_multiple` starts, an error may leave a partial batch. Readers report visible index gaps as `IncompleteGroup` and invalid encoded content as `Undecodable`. Without a total chunk count, a contiguous prefix of a `none` payload is indistinguishable from a complete value.
 
-Every group key includes `diagnostic_version_id` and `kind`, preventing chunks from different schemas or span ends from combining. There is no decode-time size limit: the pool already bounds producer input.
+Every group key includes `diagnostic_version_id` and `kind`, preventing chunks from different schemas or span ends from combining. There is no decode-time size limit. Writer-side field and chunk caps do not bound reader input: raw pool appends have no record-count cap, and compressed payloads may expand substantially. Reading a large pool or highly compressed payload can therefore require substantial memory.
 
 ## Crate design
 
@@ -371,16 +379,14 @@ enum Diagnostic {
     Event(DiagnosticEvent),
 }
 
-/// A record left as key and value: unknown to the parser, or a recognized one
-/// that failed to decode, in which case `error` says why.
+/// An uninterpreted record from a successful UTF-8 snapshot.
 struct RawKeyValue {
     key: String,
     value: String,
     error: Option<DecodeError>,
 }
 
-/// One interpreted item from `entries()`. A new known type is a new variant;
-/// everything else stays `Raw`, so a reader never drops a record.
+/// Every item from a successful snapshot is interpreted or preserved as `Raw`.
 enum Entry {
     Diagnostic(Diagnostic),
     Report(ProvisioningReport),
@@ -403,9 +409,7 @@ impl DiagnosticReader {
     /// Constructing a reader performs no IO; the pool is read by `entries()`.
     pub fn new(store: KvpPoolStore) -> Self;
 
-    /// One `Entry` per item: each diagnostic is combined and decoded, the `PROVISIONING_REPORT`
-    /// is parsed into a `ProvisioningReport`, and everything else is `Raw`. A recognized record
-    /// that will not parse is `Raw` with its `DecodeError`, so nothing is dropped.
+    /// Interprets one UTF-8 snapshot; a store failure returns no entries.
     pub fn entries(&self) -> Result<Vec<Entry>, KvpError>;
 }
 
@@ -428,7 +432,9 @@ impl DiagnosticWriter {
 
 ### CLI
 
-`dump` defaults to JSON; `--json` makes that explicit and `--text` selects human-readable output. Without `--parse`, it returns every physical record in pool order. `--parse` calls `DiagnosticReader::entries()`, returning typed diagnostics and reports while preserving other or invalid records as `Raw`.
+`dump` defaults to JSON; `--json` makes that explicit and `--text` selects human-readable output. Without `--parse`, it returns every physical record in pool order. `--parse` calls `DiagnosticReader::entries()`, returning typed diagnostics and reports while preserving other or invalid records as `Raw`. Both modes require a successful string-based snapshot; invalid physical UTF-8 fails the command without returning records.
+
+Parsed JSON and text output sort diagnostics and reports by their timestamps as instants, oldest first, including timezone offsets and available fractional precision. Equal timestamps retain first-seen pool order. Raw entries follow the timestamped entries in their original relative pool order; the CLI does not infer timestamps from malformed or unrecognized records. This presentation does not change the reader API's ordering or write to the pool.
 
 ```text
 dump                    -> JSON array of every physical {key, value} record
@@ -438,8 +444,9 @@ dump --parse --text     -> one human-readable line per interpreted entry
 ```
 
 - `--name` filters the parsed diagnostics by name; other entries are unaffected.
-- `--json` and `--text` are mutually exclusive; omitting both is equivalent to `--json`.
+- `--json` and `--text` are mutually exclusive; for `dump`, omitting both is equivalent to `--json`. Other commands retain their text defaults.
 - In parsed text output, `Text` payloads print directly and `Bytes` payloads print as standard base64 under `payload_b64`.
+- `--parse` replaces `--parse-diagnostics`; `emit --agent` replaces `--prefix`. `--tail` and `-n` are removed.
 
 Examples:
 
@@ -447,17 +454,17 @@ Examples:
 # default dump: every physical record as JSON, including the report and a truncated dmesg group
 $ dump
 [
-  {"key":"DIAG_V1|azure-init-0.1.1|vm-abc|finish|provision:run|9c1d...|2026-08-31T12:34:57.101Z|none|success|312|0","value":"provisioning succeeded"},
-  {"key":"DIAG_V1|azure-init-0.1.1|vm-abc|event|dmesg|d4e5...|2026-07-27T21:33:25.00Z|gz+b64|||17","value":"<chunk 17; rest lost>"},
-  {"key":"PROVISIONING_REPORT","value":"result=success|agent=azure-init-0.1.1|pps_type=None|vm_id=vm-abc|timestamp=2026-08-31T12:34:57.500Z"}
+  {"key":"DIAG_V1|azure-init-0.1.1|3f2504e0-4f89-41d3-9a0c-0305e82c3301|finish|provision:run|9c1d2e3f-4a5b-6c7d-8e9f-0a1b2c3d4e5f|2026-08-31T12:34:57.101Z|none|success|312|0","value":"provisioning succeeded"},
+  {"key":"DIAG_V1|azure-init-0.1.1|3f2504e0-4f89-41d3-9a0c-0305e82c3301|event|dmesg|d4e5f6a7-b8c9-0d1e-2f3a-4b5c6d7e8f90|2026-07-27T21:33:25.000Z|gz+b64|||17","value":"<chunk 17; rest lost>"},
+  {"key":"PROVISIONING_REPORT","value":"result=success|agent=azure-init-0.1.1|pps_type=None|vm_id=3f2504e0-4f89-41d3-9a0c-0305e82c3301|timestamp=2026-08-31T12:34:57.500Z"}
 ]
 
 # --parse remains JSON: the diagnostic decodes, the report parses, and the dmesg chunk stays Raw
 $ dump --parse
 [
-  {"type":"diagnostic","kind":"finish","name":"provision:run","event_id":"9c1d...","timestamp":"2026-08-31T12:34:57.101Z","result":"success","duration":312,"payload":"provisioning succeeded"},
-  {"type":"raw","key":"DIAG_V1|azure-init-0.1.1|vm-abc|event|dmesg|d4e5...|gz+b64|||17","value":"<chunk 17; rest lost>","error":"incomplete_group"},
-  {"type":"PROVISIONING_REPORT","result":"success","agent":"azure-init-0.1.1","vm_id":"vm-abc","timestamp":"2026-08-31T12:34:57.500Z","pps_type":"None"}
+  {"type":"diagnostic","kind":"finish","agent":"azure-init-0.1.1","vm_id":"3f2504e0-4f89-41d3-9a0c-0305e82c3301","name":"provision:run","event_id":"9c1d2e3f-4a5b-6c7d-8e9f-0a1b2c3d4e5f","timestamp":"2026-08-31T12:34:57.101Z","encoding":"none","result":"success","duration":312,"payload":"provisioning succeeded"},
+  {"type":"PROVISIONING_REPORT","result":"success","agent":"azure-init-0.1.1","vm_id":"3f2504e0-4f89-41d3-9a0c-0305e82c3301","timestamp":"2026-08-31T12:34:57.500Z","pps_type":"None"},
+  {"type":"raw","key":"DIAG_V1|azure-init-0.1.1|3f2504e0-4f89-41d3-9a0c-0305e82c3301|event|dmesg|d4e5f6a7-b8c9-0d1e-2f3a-4b5c6d7e8f90|2026-07-27T21:33:25.000Z|gz+b64|||17","value":"<chunk 17; rest lost>","error":"incomplete_group"}
 ]
 ```
 
@@ -494,8 +501,12 @@ The bridge maps fields onto the model:
 | duration | value field on a finish (seconds; the bridge converts to milliseconds) |
 | encoding | the value `{encoding, data}` envelope, not the key |
 
+Finish results `SUCCESS` and `FAIL` map to `success` and `fail`. An unmappable result such as `WARN` is preserved as `Raw` with `Malformed`; it is not coerced to a verdict or reclassified as an event. Source types other than `start` and `finish`, including standalone warnings, map to `event` without a span outcome. Duration conversion truncates fractional milliseconds and rejects negative or overflowing values.
+
 The bridge uses cloud-init's `incarnation` to keep chunk groups separate, then discards it; `DiagnosticKey` does not expose it.
 
 The `CLOUD_INIT` prefix selects the bridge; no `DIAG_V1` field is invented. After source-specific parsing, the bridge constructs the same version-independent `DiagnosticKey` as the `DIAG_V1` parser.
 
-For cloud-init chunks, the bridge validates each `msg_i`, joins the still-escaped `msg` slices, then unescapes once. An `{encoding, data}` envelope decodes to `DiagnosticPayload::Bytes`; otherwise `msg` becomes `DiagnosticPayload::Text`. Its encoding comes from the value, not the key.
+For cloud-init chunks, the bridge validates each `msg_i` and the consistency of source metadata, joins the still-escaped `msg` slices, then unescapes once. An `{encoding, data}` envelope decodes to `DiagnosticPayload::Bytes`; otherwise `msg` becomes `DiagnosticPayload::Text`. Its encoding comes from the value, not the key.
+
+cloud-init artifacts labeled `gz+b64` may contain zlib-wrapped data and line-wrapped base64. The bridge accepts zlib or gzip under that label and removes base64 whitespace before decoding. This read-only compatibility rule does not change `DIAG_V1`, which remains gzip-only. Other envelope encodings, including standalone `b64`, are `Undecodable`.

@@ -5,7 +5,15 @@ use std::fs;
 use std::io::Write;
 use std::process::{Command, Output};
 
+use libazureinit_kvp::{
+    DiagnosticWriter, Encoding, KvpPool, KvpPoolStore, Outcome, PoolMode,
+    PROVISIONING_REPORT_KEY,
+};
+use rstest::rstest;
+use serde_json::{json, Value};
 use tempfile::TempDir;
+
+const VM_ID: &str = "0e5e179d-5341-478b-8456-fbb90621bdf8";
 
 fn kvp(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_libazureinit-kvp"))
@@ -46,6 +54,14 @@ fn assert_success(output: Output) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
+}
+
+fn assert_json(output: Output) -> Value {
+    serde_json::from_str(&assert_success(output)).unwrap()
+}
+
+fn store_at(dir: &TempDir) -> KvpPoolStore {
+    KvpPoolStore::new_in(KvpPool::Guest, dir.path(), PoolMode::Safe).unwrap()
 }
 
 #[test]
@@ -114,19 +130,19 @@ fn write_append_read_dump_entries_delete_and_clear() {
 
     assert_eq!(assert_success(kvp(&with_dir(&dir, &["read", "a"]))), "2\n");
     assert_eq!(
-        assert_success(kvp(&with_dir(&dir, &["dump"]))),
-        "a=1\na=2\n"
+        assert_json(kvp(&with_dir(&dir, &["dump"]))),
+        json!([{"key": "a", "value": "1"}, {"key": "a", "value": "2"}])
     );
     assert_eq!(assert_success(kvp(&with_dir(&dir, &["entries"]))), "a=2\n");
     assert_eq!(
         assert_success(kvp(&with_dir(&dir, &["delete", "a"]))),
         "true\n"
     );
-    assert_eq!(assert_success(kvp(&with_dir(&dir, &["dump"]))), "");
+    assert_eq!(assert_json(kvp(&with_dir(&dir, &["dump"]))), json!([]));
 
     assert_success(kvp(&with_dir(&dir, &["write", "b", "3"])));
     assert_success(kvp(&with_dir(&dir, &["clear"])));
-    assert_eq!(assert_success(kvp(&with_dir(&dir, &["dump"]))), "");
+    assert_eq!(assert_json(kvp(&with_dir(&dir, &["dump"]))), json!([]));
 }
 
 #[test]
@@ -140,7 +156,7 @@ fn load_replaces_pool_from_file() {
         &["load", "--file", input.to_str().unwrap()],
     )));
     assert_eq!(
-        assert_success(kvp(&with_dir(&dir, &["dump"]))),
+        assert_success(kvp(&with_dir(&dir, &["dump", "--text"]))),
         "a=1\nb=2\n"
     );
 }
@@ -166,7 +182,7 @@ fn append_multiple_can_read_from_stdin() {
     ));
 
     assert_eq!(
-        assert_success(kvp(&with_dir(&dir, &["dump"]))),
+        assert_success(kvp(&with_dir(&dir, &["dump", "--text"]))),
         "x=1\nx=2\ny=3\n"
     );
 }
@@ -182,7 +198,7 @@ fn append_multiple_can_read_from_file() {
         &["append-multiple", "--file", input.to_str().unwrap()],
     )));
     assert_eq!(
-        assert_success(kvp(&with_dir(&dir, &["dump"]))),
+        assert_success(kvp(&with_dir(&dir, &["dump", "--text"]))),
         "a=1\nb=2\n"
     );
 }
@@ -297,42 +313,144 @@ fn report_failure_rejects_invalid_supporting_data() {
 }
 
 #[test]
-fn dump_parse_diagnostics_json_reassembles_and_skips_raw() {
+fn parsed_dump_reassembles_and_filters_without_dropping_other_entries() {
     let dir = TempDir::new().unwrap();
+    let base = format!(
+        "DIAG_V1|agent|{VM_ID}|event|a:b|e5f01809-a7a3-4279-aa64-1f18e21eda6e|2026-08-31T00:00:00.000Z|none||"
+    );
+    for (key, value) in [
+        (format!("{base}|1"), "two"),
+        ("note".into(), "raw value"),
+        (format!("{base}|0"), "one/"),
+        ("DIAG_V2|future".into(), "preserved"),
+    ] {
+        assert_success(kvp(&with_dir(
+            &dir,
+            &["write", "--append", &key, value],
+        )));
+    }
+    assert_success(kvp(&with_dir(&dir, &["report-success", "--vm-id", VM_ID])));
     assert_success(kvp(&with_dir(
         &dir,
         &[
-            "write",
-            "--append",
-            "azure-init-x|100|vm|event|a:b|id1|2026-08-31T00:00:00Z|0",
-            "one/",
+            "emit",
+            "--name",
+            "ssh:key",
+            "--message",
+            "added",
+            "--vm-id",
+            VM_ID,
         ],
     )));
-    assert_success(kvp(&with_dir(
-        &dir,
-        &[
-            "write",
-            "--append",
-            "azure-init-x|100|vm|event|a:b|id1|2026-08-31T00:00:00Z|1",
-            "two",
-        ],
-    )));
-    assert_success(kvp(&with_dir(
-        &dir,
-        &["write", "PROVISIONING_REPORT", "result=success"],
-    )));
+    let path = store_at(&dir).path().to_path_buf();
+    let before = fs::read(&path).unwrap();
 
-    let out = assert_success(kvp(&with_dir(
+    let entries = assert_json(kvp(&with_dir(&dir, &["dump", "--parse"])));
+    assert_eq!(entries.as_array().unwrap().len(), 5);
+    assert_eq!(entries[0]["type"], "diagnostic");
+    assert_eq!(entries[0]["kind"], "event");
+    assert_eq!(entries[0]["name"], "a:b");
+    assert_eq!(entries[0]["payload"], "one/two");
+    let timed_entries = &entries.as_array().unwrap()[1..3];
+    assert!(timed_entries.iter().any(|entry| {
+        entry["type"] == "PROVISIONING_REPORT" && entry["result"] == "success"
+    }));
+    assert!(timed_entries.iter().any(|entry| entry["name"] == "ssh:key"));
+    assert_eq!(
+        entries[3],
+        json!({"type": "raw", "key": "note", "value": "raw value"})
+    );
+    assert_eq!(
+        entries[4],
+        json!({
+            "type": "raw", "key": "DIAG_V2|future", "value": "preserved",
+            "error": "unsupported_version",
+        })
+    );
+
+    let filtered = assert_json(kvp(&with_dir(
         &dir,
-        &["--json", "dump", "--parse-diagnostics"],
+        &["dump", "--parse", "--name", "ssh"],
     )));
-    assert!(out.contains("\"kind\":\"event\""));
-    assert!(out.contains("\"message\":\"one/two\""));
-    assert!(!out.contains("PROVISIONING_REPORT"));
+    assert_eq!(
+        filtered,
+        Value::Array(entries.as_array().unwrap()[1..].to_vec())
+    );
+    assert_eq!(fs::read(path).unwrap(), before);
 }
 
 #[test]
-fn dump_parse_diagnostics_text_renders_cloud_init_event() {
+fn parsed_dump_sorts_timestamps_without_reordering_reader_or_raw_dump() {
+    let dir = TempDir::new().unwrap();
+    let store = store_at(&dir);
+    let event_id = "e5f01809-a7a3-4279-aa64-1f18e21eda6e";
+    let key = |name: &str, timestamp: &str| {
+        format!("DIAG_V1|agent|{VM_ID}|event|{name}|{event_id}|{timestamp}|none|||0")
+    };
+    let records = vec![
+        ("note".into(), "raw first"),
+        (key("latest", "2026-08-31T00:00:03.000Z"), "latest"),
+        (
+            format!("CLOUD_INIT|100|event|cloud|{VM_ID}|{event_id}"),
+            r#"{"name":"cloud","type":"event","ts":"2026-08-31T00:00:02.000500Z","msg":"cloud"}"#,
+        ),
+        (
+            PROVISIONING_REPORT_KEY.into(),
+            "result=success|agent=agent|vm_id=vm|pps_type=None|timestamp=2026-08-31T02:00:02+02:00",
+        ),
+        ("DIAG_V2|future".into(), "raw second"),
+        (key("tie-first", "2026-08-31T00:00:02.000Z"), "first tie"),
+        (key("earliest", "2026-08-31T00:00:01.000Z"), "earliest"),
+        (key("tie-second", "2026-08-31T00:00:02.000Z"), "second tie"),
+    ];
+    store
+        .append_multiple(records.iter().map(|(key, value)| (key, *value)))
+        .unwrap();
+    let before = fs::read(store.path()).unwrap();
+    let reader_entries = serde_json::to_value(
+        libazureinit_kvp::DiagnosticReader::new(store.clone())
+            .entries()
+            .unwrap(),
+    )
+    .unwrap();
+    let expected = Value::Array(
+        [6, 3, 5, 7, 2, 1, 0, 4]
+            .into_iter()
+            .map(|position| reader_entries[position].clone())
+            .collect(),
+    );
+    let parsed = assert_json(kvp(&with_dir(&dir, &["dump", "--parse"])));
+    assert_eq!(parsed, expected);
+    assert_eq!(parsed[1]["timestamp"], "2026-08-31T02:00:02+02:00");
+
+    let text =
+        assert_success(kvp(&with_dir(&dir, &["dump", "--parse", "--text"])));
+    let expected_labels = [
+        "name=earliest ",
+        "PROVISIONING_REPORT=",
+        "name=tie-first ",
+        "name=tie-second ",
+        "name=cloud ",
+        "name=latest ",
+        "raw key=note ",
+        "raw key=DIAG_V2|future ",
+    ];
+    assert_eq!(text.lines().count(), expected_labels.len());
+    for (line, label) in text.lines().zip(expected_labels) {
+        assert!(line.contains(label), "expected {label:?} in {line:?}");
+    }
+
+    let physical = assert_json(kvp(&with_dir(&dir, &["dump"])));
+    let expected_physical: Vec<_> = records
+        .iter()
+        .map(|(key, value)| json!({"key": key, "value": value}))
+        .collect();
+    assert_eq!(physical, Value::Array(expected_physical));
+    assert_eq!(fs::read(store.path()).unwrap(), before);
+}
+
+#[test]
+fn parsed_dump_normalizes_cloud_init_in_json_and_text() {
     let dir = TempDir::new().unwrap();
     assert_success(kvp(&with_dir(
         &dir,
@@ -353,260 +471,209 @@ fn dump_parse_diagnostics_text_renders_cloud_init_event() {
         ],
     )));
 
+    let entries = assert_json(kvp(&with_dir(&dir, &["dump", "--parse"])));
+    assert_eq!(
+        entries[0],
+        json!({
+            "type": "diagnostic", "kind": "finish", "agent": "CLOUD_INIT",
+            "name": "modules-final/config-scripts_user", "vm_id": VM_ID,
+            "event_id": "e5f01809-a7a3-4279-aa64-1f18e21eda6e",
+            "timestamp": "2026-07-27T21:33:24.339Z", "encoding": "none",
+            "result": "success", "duration": 500, "payload": "scripts ran",
+        })
+    );
+    assert_eq!(entries[1]["kind"], "start");
+    assert!(entries[1].get("result").is_none());
+    assert!(entries[1].get("duration").is_none());
+
     let out =
-        assert_success(kvp(&with_dir(&dir, &["dump", "--parse-diagnostics"])));
-    assert!(out.contains("event kind=finish"));
+        assert_success(kvp(&with_dir(&dir, &["dump", "--parse", "--text"])));
+    assert!(out.contains("diagnostic kind=finish"));
     assert!(out.contains("agent=CLOUD_INIT"));
-    assert!(out.contains("boot_epoch=1785187982"));
+    assert!(!out.contains("boot_epoch"));
     assert!(out.contains("name=modules-final/config-scripts_user"));
     assert!(out.contains("vm_id=0e5e179d-5341-478b-8456-fbb90621bdf8"));
-    assert!(out.contains("result=SUCCESS"));
-    assert!(out.contains("timestamp=2026-07-27 21:33:24.339006 UTC"));
-    assert!(out.contains("duration=0.5"));
-    assert!(out.contains("message=scripts ran"));
-    assert!(out.contains("event kind=start"));
+    assert!(out.contains("result=success"));
+    assert!(out.contains("timestamp=2026-07-27T21:33:24.339Z"));
+    assert!(out.contains("duration=500ms"));
+    assert!(out.contains("payload=scripts ran"));
+    let start = out.lines().nth(1).unwrap();
+    assert!(start.contains("diagnostic kind=start"));
+    assert!(!start.contains("result="));
+    assert!(!start.contains("duration="));
 }
 
 #[test]
-fn dump_parse_diagnostics_json_renders_cloud_init_event() {
+fn parsed_dump_renders_bytes_reports_and_raw_errors() {
     let dir = TempDir::new().unwrap();
+    let store = store_at(&dir);
+    DiagnosticWriter::new(store.clone(), "agent", VM_ID)
+        .unwrap()
+        .emit_event(
+            "artifact",
+            vec![0, 255],
+            Some(Encoding::GzB64),
+            Some(Outcome::Failure),
+            Some(7),
+        )
+        .unwrap();
+    store.append("note", "raw value").unwrap();
+    store.append("DIAG_V1|bad", "junk").unwrap();
     assert_success(kvp(&with_dir(
         &dir,
-        &[
-            "write",
-            "--append",
-            "CLOUD_INIT|1785187982|finish|modules-final/config-scripts_user|0e5e179d-5341-478b-8456-fbb90621bdf8|e5f01809-a7a3-4279-aa64-1f18e21eda6e",
-            r#"{"name":"modules-final/config-scripts_user","type":"finish","ts":"2026-07-27T21:33:24.339006+00:00","result":"SUCCESS","duration":0.5,"msg":"scripts ran"}"#,
-        ],
+        &["report-failure", "--vm-id", VM_ID, "--reason", "bad input"],
     )));
-
-    let out = assert_success(kvp(&with_dir(
-        &dir,
-        &["--json", "dump", "--parse-diagnostics"],
-    )));
-    assert!(out.contains("\"kind\":\"finish\""));
-    assert!(out.contains("\"agent\":\"CLOUD_INIT\""));
-    assert!(out.contains("\"boot_epoch\":1785187982"));
-    assert!(out.contains("\"name\":\"modules-final/config-scripts_user\""));
-    assert!(out.contains("\"vm_id\":\"0e5e179d-5341-478b-8456-fbb90621bdf8\""));
-    assert!(
-        out.contains("\"event_id\":\"e5f01809-a7a3-4279-aa64-1f18e21eda6e\"")
-    );
-    assert!(out.contains("\"timestamp\":\"2026-07-27T21:33:24.339006Z\""));
-    assert!(out.contains("\"result\":\"SUCCESS\""));
-    assert!(out.contains("\"duration\":0.5"));
-    assert!(out.contains("\"message\":\"scripts ran\""));
-}
-
-#[test]
-fn clear_diagnostics_option_is_not_exposed() {
-    let output = kvp(&["clear", "--diagnostics"]);
-    assert_eq!(output.status.code(), Some(2));
-}
-
-#[test]
-fn dump_parse_diagnostics_text_renders_only_normalized_entries() {
-    let dir = TempDir::new().unwrap();
-    assert_success(kvp(&with_dir(
-        &dir,
-        &[
-            "write",
-            "--append",
-            "a|100|vm|event|a:b|id1|2026-08-31T00:00:00Z|0",
-            "one/",
-        ],
-    )));
-    assert_success(kvp(&with_dir(
-        &dir,
-        &[
-            "write",
-            "--append",
-            "a|100|vm|event|a:b|id1|2026-08-31T00:00:00Z|1",
-            "two",
-        ],
-    )));
-    assert_success(kvp(&with_dir(
-        &dir,
-        &["write", "PROVISIONING_REPORT", "result=success"],
-    )));
-    assert_success(kvp(&with_dir(
-        &dir,
-        &[
-            "write",
-            "--append",
-            "a|not-a-boot|vm|event|c:d|id2|2026-08-31T00:00:00Z",
-            "junk",
-        ],
-    )));
-
     let out =
-        assert_success(kvp(&with_dir(&dir, &["dump", "--parse-diagnostics"])));
-    assert!(out.contains(
-        "event kind=event agent=a boot_epoch=100 vm_id=vm \
-         name=a:b event_id=id1 timestamp=2026-08-31 00:00:00 UTC \
-         message=one/two"
-    ));
-    assert!(!out.contains("PROVISIONING_REPORT"));
-    assert!(!out.contains("junk"));
+        assert_success(kvp(&with_dir(&dir, &["dump", "--parse", "--text"])));
+    let lines: Vec<_> = out.lines().collect();
+    assert_eq!(lines.len(), 4);
+    assert!(lines[0]
+        .contains("encoding=gz+b64 result=fail duration=7ms payload_b64=AP8="));
+    assert_eq!(
+        lines[1],
+        format!(
+            "PROVISIONING_REPORT={}",
+            store.read(PROVISIONING_REPORT_KEY).unwrap().unwrap()
+        )
+    );
+    assert_eq!(lines[2], "raw key=note value=raw value");
+    assert_eq!(lines[3], "raw key=DIAG_V1|bad value=junk error=malformed diagnostic or provisioning report");
+
+    let entries =
+        assert_json(kvp(&with_dir(&dir, &["dump", "--parse", "--json"])));
+    assert_eq!(
+        entries[0]["payload"],
+        json!({"type": "bytes", "encoding": "base64", "data": "AP8="})
+    );
+    assert_eq!(entries[1]["reason"], "bad input");
+    assert_eq!(entries[3]["error"], "malformed");
 }
 
 #[test]
-fn dump_parse_diagnostics_tail_limits_to_last_events() {
-    let dir = TempDir::new().unwrap();
-    assert_success(kvp(&with_dir(
-        &dir,
-        &[
-            "write",
-            "--append",
-            "a|100|vm|event|a:b|i1|2026-08-31T00:00:00Z",
-            "first",
-        ],
-    )));
-    assert_success(kvp(&with_dir(
-        &dir,
-        &[
-            "write",
-            "--append",
-            "a|100|vm|event|c:d|i2|2026-08-31T00:00:01Z",
-            "second",
-        ],
-    )));
-
-    let out = assert_success(kvp(&with_dir(
-        &dir,
-        &["dump", "--parse-diagnostics", "-n", "1"],
-    )));
-    assert!(out.contains("second"));
-    assert!(!out.contains("first"));
-}
-
-#[test]
-fn dump_parse_diagnostics_tail_defaults_to_20_when_count_omitted() {
-    let dir = TempDir::new().unwrap();
-    for i in 1..=25 {
-        assert_success(kvp(&with_dir(
-            &dir,
-            &[
-                "write",
-                "--append",
-                &format!("a|100|vm|event|n:{i}|id{i}|2026-08-31T00:00:00Z"),
-                &format!("msg{i}"),
-            ],
-        )));
-    }
-
-    let out = assert_success(kvp(&with_dir(
-        &dir,
-        &["dump", "--parse-diagnostics", "--tail"],
-    )));
-    assert_eq!(out.lines().count(), 20);
-    assert!(out.contains("msg25"));
-    assert!(out.contains("msg6"));
-    assert!(!out.contains("msg5"));
-}
-
-#[test]
-fn dump_parse_diagnostics_filters_by_name_substring() {
-    let dir = TempDir::new().unwrap();
-    assert_success(kvp(&with_dir(
-        &dir,
-        &[
-            "write",
-            "--append",
-            "a|100|vm|event|user:add|i1|2026-08-31T00:00:00Z",
-            "u",
-        ],
-    )));
-    assert_success(kvp(&with_dir(
-        &dir,
-        &[
-            "write",
-            "--append",
-            "a|100|vm|event|ssh:key|i2|2026-08-31T00:00:01Z",
-            "s",
-        ],
-    )));
-
-    let out = assert_success(kvp(&with_dir(
-        &dir,
-        &["dump", "--parse-diagnostics", "--name", "ssh"],
-    )));
-    assert!(out.contains("ssh:key"));
-    assert!(!out.contains("user:add"));
-}
-
-#[test]
-fn dump_parse_diagnostics_include_raw_option_is_not_exposed() {
-    let output = kvp(&["dump", "--parse-diagnostics", "--include-raw"]);
+fn dump_name_requires_parse() {
+    let output = kvp(&["dump", "--name", "ssh"]);
     assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("--parse"));
 }
 
 #[test]
-fn dump_parse_diagnostics_json_skips_malformed_entries() {
+fn conflicting_output_flags_fail_before_pool_access() {
     let dir = TempDir::new().unwrap();
-    assert_success(kvp(&with_dir(
-        &dir,
-        &[
-            "write",
-            "--append",
-            "a|100|vm|event|a:b|i1|2026-08-31T00:00:00Z",
-            "hello",
-        ],
-    )));
-    assert_success(kvp(&with_dir(
-        &dir,
-        &[
-            "write",
-            "--append",
-            "a|not-a-boot|vm|event|c:d|i2|2026-08-31T00:00:00Z",
-            "junk",
-        ],
-    )));
-
-    let dump = assert_success(kvp(&with_dir(
-        &dir,
-        &["--json", "dump", "--parse-diagnostics"],
-    )));
-    assert!(dump.contains("\"kind\":\"event\""));
-    assert!(!dump.contains("junk"));
-
-    let events = assert_success(kvp(&with_dir(
-        &dir,
-        &["--json", "dump", "--parse-diagnostics", "--name", "a:b"],
-    )));
-    assert!(events.contains("\"message\":\"hello\""));
-    assert!(!events.contains("junk"));
+    let output = kvp(&with_dir(&dir, &["--json", "dump", "--text"]));
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("--json and --text cannot be used together"));
+    assert!(!store_at(&dir).path().exists());
 }
 
 #[test]
-fn emit_writes_event_readable_by_dump() {
+fn removed_diagnostic_options_are_rejected() {
+    let cases: &[(&[&str], &str)] = &[
+        (&["dump", "--parse-diagnostics"], "--parse-diagnostics"),
+        (&["dump", "--parse", "--tail"], "--tail"),
+        (&["dump", "--parse", "-n", "1"], "-n"),
+        (&["emit", "--prefix", "agent"], "--prefix"),
+    ];
+    for (args, flag) in cases {
+        let output = kvp(args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8(output.stderr)
+            .unwrap()
+            .contains(&format!("unexpected argument '{flag}'")));
+    }
+}
+
+#[test]
+fn dumps_fail_without_partial_output_for_invalid_physical_utf8() {
     let dir = TempDir::new().unwrap();
-    assert_success(kvp(&with_dir(
+    let store = store_at(&dir);
+    store
+        .append_multiple([("good", "ok"), ("bad", "value")])
+        .unwrap();
+    let mut bytes = fs::read(store.path()).unwrap();
+    let record_size = bytes.len() / 2;
+    bytes[record_size] = 0xff;
+    fs::write(store.path(), &bytes).unwrap();
+
+    for args in [
+        &["dump"][..],
+        &["dump", "--parse"],
+        &["dump", "--parse", "--text"],
+    ] {
+        let output = kvp(&with_dir(&dir, args));
+        assert_eq!(output.status.code(), Some(3));
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+    }
+    assert_eq!(fs::read(store.path()).unwrap(), bytes);
+}
+
+#[rstest]
+#[case::default_agent(None)]
+#[case::custom_agent(Some("azure-init-test"))]
+fn emit_writes_event_readable_by_dump(#[case] agent: Option<&str>) {
+    let dir = TempDir::new().unwrap();
+    let mut args = vec![
+        "emit",
+        "--name",
+        "user:create_user",
+        "--message",
+        "created azureuser",
+        "--vm-id",
+        VM_ID,
+    ];
+    if let Some(agent) = agent {
+        args.extend(["--agent", agent]);
+    }
+    assert_success(kvp(&with_dir(&dir, &args)));
+
+    let entries = assert_json(kvp(&with_dir(&dir, &["dump", "--parse"])));
+    let expected_agent = agent
+        .unwrap_or(concat!("libazureinit-kvp/", env!("CARGO_PKG_VERSION")));
+    assert_eq!(entries.as_array().unwrap().len(), 1);
+    assert_eq!(entries[0]["type"], "diagnostic");
+    assert_eq!(entries[0]["kind"], "event");
+    assert_eq!(entries[0]["agent"], expected_agent);
+    assert_eq!(entries[0]["vm_id"], VM_ID);
+    assert_eq!(entries[0]["name"], "user:create_user");
+    assert_eq!(entries[0]["payload"], "created azureuser");
+    assert_eq!(entries[0]["encoding"], "none");
+    assert!(entries[0].get("result").is_none());
+    assert!(entries[0].get("duration").is_none());
+    let event_id =
+        uuid::Uuid::parse_str(entries[0]["event_id"].as_str().unwrap())
+            .unwrap();
+    assert_eq!(event_id.get_version_num(), 4);
+
+    let raw = assert_json(kvp(&with_dir(&dir, &["dump"])));
+    let key = raw[0]["key"].as_str().unwrap();
+    assert!(
+        key.starts_with(&format!("DIAG_V1|{expected_agent}|{VM_ID}|event|"))
+    );
+    assert!(key.ends_with("|none|||0"));
+}
+
+#[test]
+fn emit_rejects_invalid_uuid_without_creating_pool() {
+    let dir = TempDir::new().unwrap();
+    let output = kvp(&with_dir(
         &dir,
         &[
             "emit",
             "--name",
-            "user:create_user",
+            "event",
             "--message",
-            "created azureuser",
+            "test",
             "--vm-id",
             "vm-emit",
-            "--prefix",
-            "azure-init-test",
         ],
-    )));
-
-    let out =
-        assert_success(kvp(&with_dir(&dir, &["dump", "--parse-diagnostics"])));
-    assert!(out.contains("vm_id=vm-emit"));
-    assert!(out.contains("name=user:create_user"));
-    assert!(out.contains("message=created azureuser"));
-
-    let json = assert_success(kvp(&with_dir(
-        &dir,
-        &["--json", "dump", "--parse-diagnostics"],
-    )));
-    assert!(json.contains("\"kind\":\"event\""));
-    assert!(json.contains("\"vm_id\":\"vm-emit\""));
-    assert!(json.contains("\"name\":\"user:create_user\""));
+    ));
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8(output.stderr).unwrap().contains("UUID"));
+    assert!(!store_at(&dir).path().exists());
 }

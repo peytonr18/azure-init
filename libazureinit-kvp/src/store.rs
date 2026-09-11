@@ -211,7 +211,7 @@ impl KvpPoolStore {
 
             let boot_time = boot_time(&*self.ops)?;
             lock_for_writing(&mut *handle)?;
-            if handle.metadata()?.mtime < boot_time {
+            if handle.metadata()?.mtime <= boot_time {
                 handle.set_len(0)?;
             }
         }
@@ -399,18 +399,7 @@ impl KvpPoolStore {
             Err(ref e) if e.kind() == ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e.into()),
         };
-        Ok(metadata.mtime < boot_time(&*self.ops)?)
-    }
-
-    /// The system boot time as a Unix epoch timestamp in seconds, read
-    /// from `/proc/stat` `btime`.
-    ///
-    /// Diagnostic event keys stamp this value so records can be
-    /// attributed to a specific boot (mirroring cloud-init's
-    /// incarnation), letting readers tell this boot's telemetry from a
-    /// previous boot's.
-    pub fn boot_epoch(&self) -> Result<i64, KvpError> {
-        boot_time(&*self.ops)
+        Ok(metadata.mtime <= boot_time(&*self.ops)?)
     }
 
     /// Variant of [`is_stale`](Self::is_stale) that takes an explicit
@@ -423,7 +412,7 @@ impl KvpPoolStore {
             Err(ref e) if e.kind() == ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e.into()),
         };
-        Ok(metadata.mtime < boot_time)
+        Ok(metadata.mtime <= boot_time)
     }
 
     fn iter(&self) -> Result<KvpPoolIter, KvpError> {
@@ -1249,6 +1238,18 @@ mod tests {
         KvpErrKind::ValueContainsNull
     )]
     #[case::load_empty_key(WriteOp::Load, "", "v", KvpErrKind::EmptyKey)]
+    #[case::append_multiple_empty_key(
+        WriteOp::AppendMultiple,
+        "",
+        "v",
+        KvpErrKind::EmptyKey
+    )]
+    #[case::append_multiple_null_key(
+        WriteOp::AppendMultiple,
+        "bad\0key",
+        "v",
+        KvpErrKind::KeyContainsNull
+    )]
     fn test_write_rejects_invalid_input(
         #[case] op: WriteOp,
         #[case] key: &str,
@@ -1261,9 +1262,13 @@ mod tests {
             WriteOp::Insert => store.insert(key, value),
             WriteOp::Append => store.append(key, value),
             WriteOp::Load => store.load(pairs([(key, value)])),
+            WriteOp::AppendMultiple => {
+                store.append_multiple(pairs([(key, value)]))
+            }
         }
         .unwrap_err();
         assert!(expected.matches(&err), "got: {err:?}");
+        assert!(!store.path().exists(), "no file on invalid input");
     }
 
     #[derive(Clone, Copy)]
@@ -1283,6 +1288,7 @@ mod tests {
         Insert,
         Append,
         Load,
+        AppendMultiple,
     }
 
     #[derive(Clone, Copy)]
@@ -1599,6 +1605,16 @@ mod tests {
         "bad\0key",
         KvpErrKind::KeyContainsNull
     )]
+    #[case::delete_multiple_empty(
+        ReadOp::DeleteMultiple,
+        "",
+        KvpErrKind::EmptyKey
+    )]
+    #[case::delete_multiple_null(
+        ReadOp::DeleteMultiple,
+        "bad\0key",
+        KvpErrKind::KeyContainsNull
+    )]
     fn test_bad_key_is_rejected(
         #[case] op: ReadOp,
         #[case] bad_key: &str,
@@ -1611,6 +1627,9 @@ mod tests {
         let err = match op {
             ReadOp::Read => store.read(bad_key).unwrap_err(),
             ReadOp::Delete => store.delete(bad_key).unwrap_err(),
+            ReadOp::DeleteMultiple => {
+                store.delete_multiple(vec![bad_key]).unwrap_err()
+            }
         };
         assert!(expected.matches(&err), "got {err:?}");
         assert_eq!(store.read("k1").unwrap(), Some("v1".to_string()));
@@ -1621,6 +1640,7 @@ mod tests {
     enum ReadOp {
         Read,
         Delete,
+        DeleteMultiple,
     }
 
     #[test]
@@ -1898,29 +1918,6 @@ mod tests {
     }
 
     #[test]
-    fn test_append_multiple_rejects_empty_key() {
-        let dir = TempDir::new().unwrap();
-        let store = safe_store(dir.path());
-
-        let err = store
-            .append_multiple(pairs([("ok", "v"), ("", "bad")]))
-            .unwrap_err();
-        assert!(matches!(err, KvpError::EmptyKey), "got {err:?}");
-        assert!(!store.path().exists());
-    }
-
-    #[test]
-    fn test_append_multiple_rejects_null_in_key() {
-        let dir = TempDir::new().unwrap();
-        let store = safe_store(dir.path());
-
-        let err = store
-            .append_multiple(pairs([("ok\0bad", "v")]))
-            .unwrap_err();
-        assert!(matches!(err, KvpError::KeyContainsNull), "got {err:?}");
-    }
-
-    #[test]
     fn test_append_multiple_does_not_enforce_unique_key_cap() {
         let dir = TempDir::new().unwrap();
         let store = safe_store(dir.path());
@@ -2027,31 +2024,6 @@ mod tests {
         let removed = store.delete_multiple(vec!["a", "a", "a"]).unwrap();
         assert_eq!(removed, 1);
         assert_eq!(store.dump().unwrap(), pairs([("b", "2")]));
-    }
-
-    #[test]
-    fn test_delete_multiple_rejects_empty_key() {
-        let dir = TempDir::new().unwrap();
-        let store = safe_store(dir.path());
-        store.load(pairs([("a", "1")])).unwrap();
-
-        let err = store
-            .delete_multiple(vec!["a".to_string(), "".to_string()])
-            .unwrap_err();
-        assert!(matches!(err, KvpError::EmptyKey), "got {err:?}");
-
-        assert_eq!(store.dump().unwrap(), pairs([("a", "1")]));
-    }
-
-    #[test]
-    fn test_delete_multiple_rejects_null_in_key() {
-        let dir = TempDir::new().unwrap();
-        let store = safe_store(dir.path());
-        store.load(pairs([("a", "1")])).unwrap();
-
-        let err = store.delete_multiple(vec!["bad\0key"]).unwrap_err();
-        assert!(matches!(err, KvpError::KeyContainsNull), "got {err:?}");
-        assert_eq!(store.dump().unwrap(), pairs([("a", "1")]));
     }
 
     #[test]
@@ -3469,17 +3441,6 @@ mod tests {
         let (store, ops, p) = mock_store(PoolMode::Safe);
         ops.put_file(&p, vec![0u8; RECORD_SIZE], 10);
         ops.set_boot_time(5);
-        store.clear_if_stale().unwrap();
-        assert_eq!(ops.lock().files.get(&p).unwrap().len(), RECORD_SIZE);
-    }
-
-    #[test]
-    fn test_clear_if_stale_keeps_file_written_in_boot_second() {
-        let (store, ops, p) = mock_store(PoolMode::Safe);
-        ops.put_file(&p, vec![0u8; RECORD_SIZE], 10);
-        ops.set_boot_time(10);
-
-        assert!(!store.is_stale().unwrap());
         store.clear_if_stale().unwrap();
         assert_eq!(ops.lock().files.get(&p).unwrap().len(), RECORD_SIZE);
     }
