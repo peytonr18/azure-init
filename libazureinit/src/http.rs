@@ -65,28 +65,6 @@ pub(crate) async fn get(
     request(client, req, retry_interval, retry_for).await
 }
 
-/// Send an HTTP POST request to the given URL with the specified body.
-///
-/// `body` must implement Clone as retries must clone the entire request.
-#[instrument(err, skip_all)]
-pub(crate) async fn post<T: Into<reqwest::Body> + Clone>(
-    client: &Client,
-    headers: HeaderMap,
-    body: T,
-    request_timeout: Duration,
-    retry_interval: Duration,
-    retry_for: Duration,
-    url: &str,
-) -> Result<(reqwest::Response, Duration), Error> {
-    let req = client
-        .post(url)
-        .headers(headers)
-        .body(body)
-        .timeout(request_timeout)
-        .build()?;
-    request(client, req, retry_interval, retry_for).await
-}
-
 /// Retry an HTTP request until it returns HTTP 200 or the timeout is reached.
 ///
 /// In the event that the request succeeds, the total remaining timeout is returned with the response.
@@ -95,7 +73,7 @@ pub(crate) async fn post<T: Into<reqwest::Body> + Clone>(
 /// # Panics
 ///
 /// This function will panic if the request passed cannot be cloned (i.e. the body is a Stream).
-/// Functions wrapping this must ensure to include an additional bound on `Body` (see [`post`]).
+/// This module constructs GET requests with empty, cloneable bodies.
 #[instrument(skip_all)]
 async fn request(
     client: &Client,

@@ -1,63 +1,27 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! HTTP-only provisioning-health reporting to the Azure wireserver.
+//! Async compatibility adapters for the shared, blocking health client.
 //!
-//! Callers publish KVP reports independently. Failure delivery uses the
-//! supplied report's encoding without changing its timestamp or context.
+//! KVP publication and provisioning-result policy remain caller-owned. These
+//! adapters preserve JSON-only delivery and the existing configuration format.
 
-use libazureinit_kvp::ProvisioningReport;
-use reqwest::{
-    header::{HeaderMap, HeaderValue, USER_AGENT},
-    Client,
+use libazureinit_kvp::{
+    ProvisioningReport, WireserverClient, WireserverConfig, WireserverDelivery,
+    WireserverError,
 };
+use std::io;
 use std::time::Duration;
 use tracing::instrument;
 
-use reqwest::StatusCode;
-use serde_json::json;
-
 use crate::config::Wireserver;
 use crate::error::Error;
-use crate::http;
-
-#[derive(Debug)]
-enum ProvisioningState {
-    Ready,
-    NotReady,
-}
-
-#[derive(Debug)]
-enum ProvisioningSubStatus {
-    ProvisioningFailed,
-    Provisioning,
-}
-
-impl std::fmt::Display for ProvisioningState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            ProvisioningState::Ready => "Ready",
-            ProvisioningState::NotReady => "NotReady",
-        };
-        write!(f, "{s}")
-    }
-}
-
-impl std::fmt::Display for ProvisioningSubStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            ProvisioningSubStatus::ProvisioningFailed => "ProvisioningFailed",
-            ProvisioningSubStatus::Provisioning => "Provisioning",
-        };
-        write!(f, "{s}")
-    }
-}
 
 /// Reports successful provisioning to the wireserver with a state-only request.
 #[instrument(skip_all)]
 pub async fn report_ready(config: &Wireserver) -> Result<(), Error> {
     tracing::info!("Reporting provisioning complete");
-    _report(ProvisioningState::Ready, None, None, config).await
+    deliver(config, |client| client.report_success()).await
 }
 
 /// Reports provisioning failure using the supplied report's exact encoding.
@@ -65,13 +29,8 @@ pub async fn report_failure(
     report: &ProvisioningReport,
     config: &Wireserver,
 ) -> Result<(), Error> {
-    _report(
-        ProvisioningState::NotReady,
-        Some(ProvisioningSubStatus::ProvisioningFailed),
-        Some(report.encode()),
-        config,
-    )
-    .await
+    let report = report.clone();
+    deliver(config, move |client| client.report_failure(&report)).await
 }
 
 /// Reports provisioning as still in progress over HTTP, without publishing KVP.
@@ -79,133 +38,92 @@ pub async fn report_in_progress(
     config: &Wireserver,
     vm_id: &str,
 ) -> Result<(), Error> {
-    let desc = format!("Provisioning is still in progress for vm_id={vm_id}.");
-    _report(
-        ProvisioningState::NotReady,
-        Some(ProvisioningSubStatus::Provisioning),
-        Some(desc),
-        config,
-    )
-    .await
+    let vm_id = vm_id.to_owned();
+    deliver(config, move |client| client.report_in_progress(&vm_id)).await
 }
 
-/// Internal helper that handles all HTTP details for health reporting to the wireserver.
-///
-/// Builds the JSON payload, sets required headers, and performs retries as needed.
 #[instrument(err, skip_all)]
-async fn _report(
-    state: ProvisioningState,
-    substatus: Option<ProvisioningSubStatus>,
-    description: Option<String>,
+async fn deliver(
     config: &Wireserver,
+    operation: impl FnOnce(&WireserverClient) -> Result<WireserverDelivery, WireserverError>
+        + Send
+        + 'static,
 ) -> Result<(), Error> {
-    tracing::info!(
-        target: "libazureinit::health::status",
-        "Initiating health report to wireserver: {}",
-        state
-    );
-
-    let body = if let Some(sub) = substatus {
-        json!({
-            "state": state.to_string(),
-            "details": {
-                "subStatus": sub.to_string(),
-                "description": description.unwrap_or_default(),
-            }
-        })
-        .to_string()
-    } else {
-        json!({ "state": state.to_string() }).to_string()
-    };
-
-    tracing::debug!(body=%body, "Built provisioning-health JSON");
-
-    let version = env!("CARGO_PKG_VERSION");
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        USER_AGENT,
-        HeaderValue::from_str(&format!("azure-init v{version}")).unwrap(),
-    );
-    headers.insert(
-        "x-ms-guest-agent-name",
-        HeaderValue::from_str(&format!("azure-init v{version}")).unwrap(),
-    );
-    headers
-        .insert("content-type", HeaderValue::from_static("application/json"));
-
-    tracing::debug!(?headers, "Prepared HTTP headers");
-
-    let connect_timeout =
-        Duration::from_secs_f64(config.connection_timeout_secs);
-    let read_timeout = Duration::from_secs_f64(config.read_timeout_secs);
-    let retry_for = Duration::from_secs_f64(config.total_retry_timeout_secs);
-
-    let client = Client::builder()
-        .connect_timeout(connect_timeout)
-        .timeout(read_timeout)
-        .build()?;
-
-    let mut remaining = retry_for;
-    while !remaining.is_zero() {
-        let (resp, new_remaining) = http::post(
-            &client,
-            headers.clone(),
-            body.clone(),
-            read_timeout,
-            connect_timeout,
-            remaining,
-            &config.health_endpoint,
-        )
-        .await?;
-
-        let status = resp.status();
-        for (key, value) in resp.headers().iter() {
-            tracing::info!(
-                target: "libazureinit::health::status",
-                header = %key,
-                value = ?value,
-                "Wireserver response header"
-            );
+    let config = config.clone();
+    let dispatcher = tracing::dispatcher::get_default(Clone::clone);
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || {
+        let _dispatcher = tracing::dispatcher::set_default(&dispatcher);
+        let _entered = span.enter();
+        let duration = |name, value| {
+            Duration::try_from_secs_f64(value).map_err(|error| {
+                shared_error(WireserverError::InvalidConfiguration(format!(
+                    "{name}: {error}"
+                )))
+            })
+        };
+        let connect_timeout = duration(
+            "connection_timeout_secs",
+            config.connection_timeout_secs,
+        )?;
+        let total_retry_timeout = duration(
+            "total_retry_timeout_secs",
+            config.total_retry_timeout_secs,
+        )?;
+        if total_retry_timeout.is_zero() {
+            return Err(Error::Timeout);
         }
+        let client = WireserverClient::new(
+            &format!("azure-init v{}", env!("CARGO_PKG_VERSION")),
+            WireserverConfig {
+                endpoint: config.health_endpoint,
+                connect_timeout,
+                request_timeout: duration(
+                    "read_timeout_secs",
+                    config.read_timeout_secs,
+                )?,
+                total_retry_timeout,
+                retry_interval: connect_timeout,
+                use_system_proxy: true,
+                ..WireserverConfig::default()
+            },
+        )
+        .map_err(shared_error)?;
+        let delivered = operation(&client).map_err(shared_error)?;
         tracing::info!(
             target: "libazureinit::health::status",
-            "Wireserver replied with status {}",
-            status
+            protocol = ?delivered.protocol,
+            attempts = delivered.json_attempts,
+            "WireServer acknowledged health report"
         );
+        Ok(())
+    })
+    .await
+    .map_err(|error| Error::Io(io::Error::other(error)))?
+}
 
-        if status.is_success() {
-            tracing::info!(
-                target: "libazureinit::health::status",
-                "Report '{}' succeeded",
-                state
-            );
-            return Ok(());
+fn shared_error(error: WireserverError) -> Error {
+    match error {
+        WireserverError::Request(error)
+        | WireserverError::HttpStatus {
+            source: Some(error),
+            ..
+        } => Error::Http(error),
+        WireserverError::HttpStatus {
+            endpoint, status, ..
+        } => Error::HttpStatus { endpoint, status },
+        WireserverError::Timeout { .. } => Error::Timeout,
+        WireserverError::GoalState(error) => Error::Xml(error),
+        WireserverError::InvalidConfiguration(_)
+        | WireserverError::InvalidGoalState(_)
+        | WireserverError::InvalidReport(_) => {
+            Error::Io(io::Error::new(io::ErrorKind::InvalidInput, error))
         }
-
-        if status == StatusCode::TOO_MANY_REQUESTS
-            || status == StatusCode::SERVICE_UNAVAILABLE
-            || status == StatusCode::INTERNAL_SERVER_ERROR
-        {
-            tracing::warn!(
-                "Retryable HTTP status {} received. Will retry...",
-                status
-            );
-        } else {
-            tracing::error!(
-                "Non-retryable HTTP status {}, bailing out",
-                status
-            );
-            return Err(Error::HttpStatus {
-                endpoint: config.health_endpoint.clone(),
-                status,
-            });
+        WireserverError::AttemptsExhausted { .. }
+        | WireserverError::Fallback { .. } => {
+            Error::Io(io::Error::other(error))
         }
-
-        remaining = new_remaining;
     }
-
-    tracing::warn!("Report '{}' timed out", state);
-    Err(Error::Timeout)
 }
 
 #[cfg(test)]
@@ -216,6 +134,108 @@ mod tests {
     use rstest::rstest;
     use tokio::net::TcpListener;
     use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn blocking_delivery_preserves_the_callers_tracing_context() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let server = tokio::spawn(serve_requests(
+            listener,
+            get_http_response_payload(&StatusCode::OK, ""),
+            cancel.clone(),
+        ));
+        report_ready(&fast_config(format!("http://{address}")))
+            .await
+            .unwrap();
+        cancel.cancel();
+        assert_eq!(server.await.unwrap(), 1);
+        assert!(logs_contain("WireServer acknowledged health report"));
+    }
+
+    #[tokio::test]
+    async fn invalid_timeout_values_are_errors_not_panics() {
+        for value in [-1.0, f64::NAN, f64::INFINITY] {
+            for field in ["connection", "request", "total"] {
+                let mut config = Wireserver::default();
+                match field {
+                    "connection" => config.connection_timeout_secs = value,
+                    "request" => config.read_timeout_secs = value,
+                    "total" => config.total_retry_timeout_secs = value,
+                    _ => unreachable!(),
+                }
+                assert!(matches!(
+                    report_ready(&config).await,
+                    Err(Error::Io(error))
+                        if error.kind() == io::ErrorKind::InvalidInput
+                ));
+            }
+        }
+        let config = Wireserver {
+            total_retry_timeout_secs: 0.0,
+            ..Wireserver::default()
+        };
+        assert!(matches!(report_ready(&config).await, Err(Error::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn a_worker_panic_is_an_explicit_delivery_error() {
+        let result = deliver(&Wireserver::default(), |_| {
+            panic!("expected health worker panic")
+        })
+        .await;
+        assert!(matches!(result, Err(Error::Io(_))));
+    }
+
+    #[test]
+    fn shared_errors_preserve_the_compatibility_error_types() {
+        let error = shared_error(WireserverError::HttpStatus {
+            endpoint: "http://example.test/health".into(),
+            status: StatusCode::FOUND,
+            source: None,
+        });
+        assert!(matches!(
+            error,
+            Error::HttpStatus {
+                status: StatusCode::FOUND,
+                ..
+            }
+        ));
+        let xml_error = serde_xml_rs::from_str::<String>("<").unwrap_err();
+        assert!(matches!(
+            shared_error(WireserverError::GoalState(xml_error)),
+            Error::Xml(_)
+        ));
+        for error in [
+            WireserverError::InvalidConfiguration("invalid".into()),
+            WireserverError::InvalidGoalState("missing ID"),
+            WireserverError::InvalidReport("invalid state".into()),
+        ] {
+            assert!(matches!(
+                shared_error(error),
+                Error::Io(error) if error.kind() == io::ErrorKind::InvalidInput
+            ));
+        }
+        for error in [
+            WireserverError::AttemptsExhausted {
+                endpoint: "http://example.test/health".into(),
+                attempts: 1,
+                last_error: Box::new(WireserverError::InvalidReport(
+                    "failed".into(),
+                )),
+            },
+            WireserverError::Fallback {
+                json: Box::new(WireserverError::InvalidReport("JSON".into())),
+                xml: Box::new(WireserverError::InvalidReport("XML".into())),
+            },
+        ] {
+            assert!(matches!(
+                shared_error(error),
+                Error::Io(error) if error.kind() == io::ErrorKind::Other
+            ));
+        }
+    }
 
     fn fast_config(mock_url: String) -> Wireserver {
         Wireserver {
@@ -349,7 +369,7 @@ mod tests {
         }
     }
 
-    /// The public wrappers at least compile and call into `_report`.
+    /// Exercise the public async adapters against an unresponsive endpoint.
     /// Here we point at an unresponsive loopback endpoint, and with tiny timeouts
     /// we expect both `report_ready` and `report_failure` to error out fast.
     #[tokio::test]

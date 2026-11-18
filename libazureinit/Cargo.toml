@@ -10,7 +10,7 @@ license = "MIT"
 description = "A common library for provisioning Linux VMs on Azure."
 
 [dependencies]
-libazureinit-kvp = { path = "../libazureinit-kvp", version = "0.1.0" }
+libazureinit-kvp = { path = "../libazureinit-kvp", version = "0.1.0", features = ["wireserver"] }
 reqwest = { version = "0.13.1", default-features = false, features = ["blocking", "json"] }
 serde = {version = "1.0.163", features = ["derive"]}
 thiserror = "2.0.3"

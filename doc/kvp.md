@@ -50,6 +50,10 @@ and the Hyper-V host:
 The guest application never talks directly to VMBus. It only
 reads and writes pool files; the daemon and kernel handle transport.
 
+The library also offers an optional, separate HTTP health transport and a
+combined `HealthWriter`. These do not change KVP transport or require a tracing
+subscriber. See [Direct Provisioning Health APIs](health-reporting.md).
+
 ---
 
 ## Pool files

@@ -6,9 +6,34 @@
 //! Reads `/sys/class/dmi/id/product_uuid` and adjusts Gen1 UUID byte order.
 
 use std::fs;
+use std::io;
 use std::path::Path;
 
 use uuid::Uuid;
+
+/// Reads the local VM UUID without a network request or tracing subscriber.
+///
+/// Reads `/sys/class/dmi/id/product_uuid`, validates the UUID and adjusts Gen1
+/// byte order. Returns I/O or invalid-data errors rather than inventing an ID.
+/// Callers may instead supply an already known VM ID directly to the writers.
+pub fn read_vm_id() -> io::Result<String> {
+    read_vm_id_at("/sys/class/dmi/id/product_uuid", is_vm_gen1(None, None))
+}
+
+fn read_product_uuid(path: &str) -> io::Result<String> {
+    Ok(fs::read_to_string(path)?.trim().to_lowercase())
+}
+
+fn read_vm_id_at(path: &str, gen1: bool) -> io::Result<String> {
+    let value = read_product_uuid(path)?;
+    let uuid = Uuid::parse_str(&value)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(if gen1 {
+        swap_uuid_to_little_endian(*uuid.as_bytes()).to_string()
+    } else {
+        uuid.to_string()
+    })
+}
 
 /// Returns the current VM ID, adjusting UUID byte order on Gen1 VMs.
 ///
@@ -24,8 +49,8 @@ fn private_get_vm_id(
 ) -> Option<String> {
     let path = product_uuid_path.unwrap_or("/sys/class/dmi/id/product_uuid");
 
-    let system_uuid = match fs::read_to_string(path) {
-        Ok(s) => s.trim().to_lowercase(),
+    let system_uuid = match read_product_uuid(path) {
+        Ok(s) => s,
         Err(err) => {
             tracing::error!("Failed to read VM ID from {}: {}", path, err);
             return None;
@@ -100,6 +125,51 @@ fn swap_uuid_to_little_endian(mut bytes: [u8; 16]) -> Uuid {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn fallible_lookup_validates_and_normalizes_both_vm_generations() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("uuid");
+        fs::write(&path, " 550E8400-E29B-41D4-A716-446655440000\n").unwrap();
+        let path = path.to_str().unwrap();
+        assert_eq!(
+            read_vm_id_at(path, false).unwrap(),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(
+            read_vm_id_at(path, true).unwrap(),
+            "00840e55-9be2-d441-a716-446655440000"
+        );
+        for invalid in ["", "not-a-uuid"] {
+            fs::write(path, invalid).unwrap();
+            assert_eq!(
+                read_vm_id_at(path, false).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        fs::write(path, [0xff]).unwrap();
+        assert_eq!(
+            read_vm_id_at(path, false).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        fs::remove_file(path).unwrap();
+        assert_eq!(
+            read_vm_id_at(path, false).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn public_fallible_lookup_uses_the_documented_defaults() {
+        let expected = read_vm_id_at(
+            "/sys/class/dmi/id/product_uuid",
+            is_vm_gen1(None, None),
+        );
+        assert_eq!(
+            read_vm_id().map_err(|error| error.kind()),
+            expected.map_err(|error| error.kind())
+        );
+    }
 
     #[test]
     fn gen1_when_no_efi_paths_exist() {

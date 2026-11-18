@@ -19,7 +19,7 @@ fn now_rfc3339() -> String {
 /// State of a provisioning attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-enum ReportResult {
+pub enum ReportResult {
     /// No final result has been published for this attempt.
     InProgress,
     /// Provisioning completed successfully.
@@ -148,6 +148,46 @@ pub struct ProvisioningReport {
 }
 
 impl ProvisioningReport {
+    /// Returns the explicitly reported provisioning state.
+    pub fn result(&self) -> ReportResult {
+        self.result
+    }
+
+    /// Returns the reporting agent identifier.
+    pub fn agent(&self) -> &str {
+        &self.agent
+    }
+
+    /// Returns the caller-supplied VM identifier.
+    pub fn vm_id(&self) -> &str {
+        &self.vm_id
+    }
+
+    /// Returns the timestamp captured when this report was constructed.
+    pub fn timestamp(&self) -> &str {
+        &self.timestamp
+    }
+
+    /// Returns the pre-provisioning state.
+    pub fn pps_type(&self) -> ReportPpsType {
+        self.pps_type
+    }
+
+    /// Returns the failure reason, if this is a failure report.
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+
+    /// Returns the optional failure documentation URL.
+    pub fn documentation_url(&self) -> Option<&str> {
+        self.documentation_url.as_deref()
+    }
+
+    /// Returns supporting data, preserving order and duplicate keys.
+    pub fn extra(&self) -> &[(String, String)] {
+        &self.extra
+    }
+
     /// Creates a report marking the start of a new provisioning attempt.
     ///
     /// Starts with a fresh timestamp and no prior failure context.
@@ -459,6 +499,53 @@ mod tests {
     const VM_ID: &str = "00000000-0000-0000-0000-000000000abc";
     const AGENT: &str = "Azure-Init/0.0.0";
     const TS: &str = "2026-06-17T00:00:00+00:00";
+
+    #[rstest]
+    #[case(ReportResult::Success)]
+    #[case(ReportResult::Error)]
+    #[case(ReportResult::InProgress)]
+    fn public_accessors_preserve_the_report_contract(
+        #[case] result: ReportResult,
+    ) {
+        let report = match result {
+            ReportResult::Success => {
+                ProvisioningReport::success(AGENT, VM_ID, ReportPpsType::OsDisk)
+            }
+            ReportResult::Error => ProvisioningReport::failure(
+                AGENT,
+                VM_ID,
+                "bad config",
+                ReportPpsType::OsDisk,
+            )
+            .with_documentation_url("https://example.test/help"),
+            ReportResult::InProgress => ProvisioningReport::in_progress(
+                AGENT,
+                VM_ID,
+                ReportPpsType::OsDisk,
+            ),
+        }
+        .with_extra("boot_id", "test-boot");
+        let decoded: ProvisioningReport = report.encode().parse().unwrap();
+        assert_eq!(decoded.result(), result);
+        assert_eq!(decoded.agent(), AGENT);
+        assert_eq!(decoded.vm_id(), VM_ID);
+        assert_eq!(decoded.timestamp(), report.timestamp());
+        assert_eq!(decoded.pps_type(), ReportPpsType::OsDisk);
+        assert_eq!(
+            decoded.extra(),
+            &[("boot_id".to_owned(), "test-boot".to_owned())]
+        );
+        if result == ReportResult::Error {
+            assert_eq!(decoded.reason(), Some("bad config"));
+            assert_eq!(
+                decoded.documentation_url(),
+                Some("https://example.test/help")
+            );
+        } else {
+            assert_eq!(decoded.reason(), None);
+            assert_eq!(decoded.documentation_url(), None);
+        }
+    }
 
     fn safe_store(dir: &TempDir) -> KvpPoolStore {
         KvpPoolStore::new_in(KvpPool::Guest, dir.path(), PoolMode::Safe)

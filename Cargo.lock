@@ -825,10 +825,13 @@ dependencies = [
  "csv",
  "flate2",
  "libc",
+ "reqwest",
  "rstest",
  "serde",
+ "serde-xml-rs",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.18",
  "tracing",
  "uuid",
 ]
